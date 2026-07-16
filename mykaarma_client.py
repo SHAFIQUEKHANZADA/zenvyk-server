@@ -51,12 +51,15 @@ async def _get(url: str, dealer: Dict[str, str], step: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CUSTOMER  —  Save Customer with searchForDuplicate=true
-#    Finds an existing customer OR creates one, and returns their vehicles.
+#    Finds an existing customer OR creates one.
 #
-#    ⚠️  VERIFY THIS PATH against the docs page
-#        "Create or update customer with search for duplicates"
-#        (the appointment doc links to it but doesn't print the URL).
-#        Fix the CUSTOMER_PATH constant below once you confirm it in Postman.
+#    VERIFIED LIVE against the sandbox 2026-07-16. Notes learned the hard way:
+#      * everything goes inside a "customer" object; "vehicles" is TOP level
+#      * phone MUST be E.164:  +16305550147   (bare 6305550147 is rejected)
+#      * phone/email objects need a "label" (CELL / HOME) or they're dropped
+#      * VIN must pass the real VIN checksum or it's silently rejected
+#      * the response does NOT contain vehicle UUIDs — only customerUuid.
+#        Pass the VIN to the appointment call instead (myKaarma resolves it).
 # ─────────────────────────────────────────────────────────────────────────────
 CUSTOMER_PATH = "/customer/v2/department/{department_uuid}/customer"
 
@@ -68,24 +71,59 @@ async def save_customer(
     last_name: Optional[str] = None,
     email: Optional[str] = None,
     vin: Optional[str] = None,
+    vehicle_year: Optional[str] = None,
+    vehicle_make: Optional[str] = None,
+    vehicle_model: Optional[str] = None,
 ) -> dict:
     url = MYKAARMA_BASE_URL + CUSTOMER_PATH.format(
         department_uuid=dealer["department_uuid"]
     )
 
-    payload: Dict[str, Any] = {"searchForDuplicate": True}
-    if phone:
-        payload["phoneNumbers"] = [{"number": phone, "type": "CELL"}]
+    customer: Dict[str, Any] = {}
     if first_name:
-        payload["firstName"] = first_name
+        customer["firstName"] = first_name
     if last_name:
-        payload["lastName"] = last_name
+        customer["lastName"] = last_name
     if email:
-        payload["emails"] = [{"address": email}]
+        customer["emails"] = [
+            {"emailAddress": email, "label": "HOME", "okToEmail": True, "isPreferred": True}
+        ]
+    if phone:
+        customer["phoneNumbers"] = [
+            {
+                "phoneNumber": normalize_phone(phone),
+                "label": "CELL",
+                "okToCall": True,
+                "okToText": True,
+                "isPreferred": True,
+            }
+        ]
+
+    payload: Dict[str, Any] = {"customer": customer, "searchForDuplicate": True}
+
+    vehicle: Dict[str, Any] = {}
     if vin:
-        payload["vehicles"] = [{"vin": vin}]
+        vehicle["vin"] = vin
+    if vehicle_year:
+        vehicle["vehicleYear"] = str(vehicle_year)
+    if vehicle_make:
+        vehicle["vehicleMake"] = vehicle_make
+    if vehicle_model:
+        vehicle["vehicleModel"] = vehicle_model
+    if vehicle:
+        payload["vehicles"] = [vehicle]
 
     return await _post(url, dealer, payload, step="save_customer")
+
+
+def normalize_phone(phone: str) -> str:
+    """myKaarma rejects anything that isn't E.164 (+1XXXXXXXXXX)."""
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return phone if str(phone).startswith("+") else f"+{digits}"
 
 
 def parse_customer(data: dict) -> dict:
@@ -118,9 +156,11 @@ def parse_customer(data: dict) -> dict:
 # 2. OPCODES  —  the service catalogue.
 #    The caller says "oil change"; myKaarma needs an operationUuid.
 #
-#    ⚠️  VERIFY THIS PATH against "How to get opcodes and menus".
+#    VERIFIED LIVE 2026-07-16. It is a POST (not GET) to /opcodes/v1/dealers/...
+#    NOTE: do NOT send onlineSchedulerVisibility:true — in the sandbox that
+#    filters everything out and returns an empty list.
 # ─────────────────────────────────────────────────────────────────────────────
-OPCODES_PATH = "/kopcode/v1/dealer/{dealer_uuid}/opcodes"
+OPCODES_PATH = "/opcodes/v1/dealers/{dealer_uuid}/operations/searches"
 
 # dealer_key -> { "oil change": {"uuid": ..., "laborOpCode": ..., "minutes": ...} }
 _opcode_cache: Dict[str, Dict[str, dict]] = {}
@@ -132,28 +172,33 @@ async def get_opcodes(dealer: Dict[str, str], force: bool = False) -> Dict[str, 
         return _opcode_cache[key]
 
     url = MYKAARMA_BASE_URL + OPCODES_PATH.format(dealer_uuid=dealer["dealer_uuid"])
-    data = await _get(url, dealer, step="get_opcodes")
+    data = await _post(
+        url,
+        dealer,
+        {"resultSize": 50, "startPosition": 0, "getTotalCount": True},
+        step="get_opcodes",
+    )
 
-    raw = data.get("opcodes") if isinstance(data, dict) else data
     catalog: Dict[str, dict] = {}
-    for op in raw or []:
-        name = (
-            op.get("description")
-            or op.get("opCodeName")
-            or op.get("laborOpCode")
-            or ""
-        ).strip().lower()
-        if not name:
-            continue
-        catalog[name] = {
+    for op in data.get("operationDTOList") or []:
+        # index by every name we might match on
+        names = {
+            (op.get("description") or "").strip().lower(),
+            (op.get("opCodeName") or "").strip().lower(),
+            (op.get("laborOpCode") or "").strip().lower(),
+        }
+        entry = {
             "uuid": op.get("uuid"),
             "laborOpCode": op.get("laborOpCode"),
-            "minutes": op.get("durationInMins"),
-            "name": name,
+            "minutes": op.get("opCodeDurationInMinutes"),
+            "name": op.get("description") or op.get("opCodeName"),
         }
+        for n in names:
+            if n:
+                catalog[n] = entry
 
     _opcode_cache[key] = catalog
-    log.info("cached %d opcodes for %s", len(catalog), key)
+    log.info("cached %d opcode names for %s", len(catalog), key)
     return catalog
 
 
@@ -196,20 +241,44 @@ async def get_availability(
     customer_uuid: Optional[str] = None,
     vehicle_uuid: Optional[str] = None,
     operation_uuid: Optional[str] = None,
+    vin: Optional[str] = None,
+    start_time: str = "08:00:00",
+    end_time: str = "19:00:00",
 ) -> List[str]:
+    """
+    VERIFIED LIVE 2026-07-16 — structure below matches the docs exactly.
+    IMPORTANT: customerInformation/vehicleInformation use the key "uuid",
+    NOT "customerUuid"/"vehicleUuid" (that mistake returns a 500).
+    """
     url = MYKAARMA_BASE_URL + AVAILABILITY_PATH.format(
         department_uuid=dealer["department_uuid"]
     )
 
+    empty_attrs = {
+        "dealerAssociateUuidList": [],
+        "transportOptionUuidList": [],
+        "teamUuidList": [],
+        "subTransportOptionUuidList": [],
+    }
+
     payload: Dict[str, Any] = {
+        "platform": {"name": "Web"},
         "dates": dates,
-        "selectedAvailabilityAttributes": {},  # no advisor/team/transport preference
-        "allAvailabilityAttributes": {},
+        "startTime": start_time,
+        "endTime": end_time,
+        "selectedAvailabilityAttributes": dict(empty_attrs),
+        "allAvailabilityAttributes": dict(empty_attrs),
+        "fetchAvailability": True,
     }
     if customer_uuid:
-        payload["customerInformation"] = {"customerUuid": customer_uuid}
-    if vehicle_uuid:
-        payload["vehicleInformation"] = {"vehicleUuid": vehicle_uuid}
+        payload["customerInformation"] = {"uuid": customer_uuid}
+    if vehicle_uuid or vin:
+        vi: Dict[str, Any] = {}
+        if vehicle_uuid:
+            vi["uuid"] = vehicle_uuid
+        if vin:
+            vi["vin"] = vin
+        payload["vehicleInformation"] = vi
     if operation_uuid:
         payload["selectedOperationUuidSet"] = [operation_uuid]
 
@@ -253,13 +322,19 @@ APPOINTMENT_PATH = "/appointment/v2/dealer/{dealer_uuid}/appointment"
 async def create_appointment(
     dealer: Dict[str, str],
     customer_uuid: str,
-    vehicle_uuid: str,
     start: str,  # "2026-07-16T09:30:00"
+    vehicle_uuid: Optional[str] = None,
+    vin: Optional[str] = None,
     service_op: Optional[dict] = None,
     phone: Optional[str] = None,
     email: Optional[str] = None,
     comments: Optional[str] = None,
 ) -> dict:
+    """
+    VERIFIED LIVE 2026-07-16 — the endpoint accepts and validates this payload.
+    Either vehicle_uuid OR vin must be provided. Since save_customer does NOT
+    return vehicle UUIDs, we normally pass the VIN and let myKaarma resolve it.
+    """
     url = MYKAARMA_BASE_URL + APPOINTMENT_PATH.format(dealer_uuid=dealer["dealer_uuid"])
 
     minutes = (service_op or {}).get("minutes") or DEFAULT_APPOINTMENT_MINUTES
@@ -277,9 +352,15 @@ async def create_appointment(
             }
         ]
 
+    vehicle_info: Dict[str, Any] = {}
+    if vehicle_uuid:
+        vehicle_info["vehicleUuid"] = vehicle_uuid
+    if vin:
+        vehicle_info["vin"] = vin
+
     payload = {
         "customerUuid": customer_uuid,
-        "vehicleInformation": {"vehicleUuid": vehicle_uuid},
+        "vehicleInformation": vehicle_info,
         "appointmentInformation": {
             "appointmentStartDateTime": start,
             "appointmentEndDateTime": end,
