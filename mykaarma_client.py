@@ -337,10 +337,9 @@ async def create_appointment(
     """
     url = MYKAARMA_BASE_URL + APPOINTMENT_PATH.format(dealer_uuid=dealer["dealer_uuid"])
 
-    minutes = (service_op or {}).get("minutes") or DEFAULT_APPOINTMENT_MINUTES
-    end_dt = datetime.fromisoformat(start) + timedelta(minutes=int(minutes) - 1, seconds=59)
-    end = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
-
+    # Per myKaarma support (2026-07-16): do NOT send appointmentEndDateTime.
+    # Sending it caused NO_TIME_INTERVAL_EXISTS. myKaarma determines the end
+    # time automatically from the service duration.
     service_list = []
     if service_op:
         service_list = [
@@ -363,7 +362,6 @@ async def create_appointment(
         "vehicleInformation": vehicle_info,
         "appointmentInformation": {
             "appointmentStartDateTime": start,
-            "appointmentEndDateTime": end,
             "transportOption": None,
             "assignedUser": None,   # myKaarma picks the advisor
             "creatorUser": None,
