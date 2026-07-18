@@ -62,6 +62,28 @@ def parse_appointment_time(raw: str) -> Optional[str]:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _clamp_business(dt: datetime) -> datetime:
+    """Move dt into business hours (8:00–16:59), skip Sundays, never in the past."""
+    now = datetime.now(DEALER_TZ).replace(tzinfo=None)
+    if dt < now:
+        dt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if dt.hour < 8:
+        dt = dt.replace(hour=8, minute=0, second=0, microsecond=0)
+    if dt.hour >= 17:
+        dt = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+    if dt.weekday() == 6:  # Sunday
+        dt = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+    return dt
+
+
+def candidate_times(start_iso: str, count: int = 16):
+    """Yield bookable candidate times from start, +1hr steps, within 8–5, weekdays+Sat."""
+    dt = _clamp_business(datetime.fromisoformat(start_iso))
+    for _ in range(count):
+        yield dt.strftime("%Y-%m-%dT%H:%M:%S")
+        dt = _clamp_business(dt + timedelta(hours=1))
+
+
 # ─────────────────────────────────────────────────────────────
 # Request models
 # ─────────────────────────────────────────────────────────────
@@ -302,46 +324,56 @@ async def book_appointment(req: BookRequest):
     except mk.MyKaarmaError:
         op = None
 
-    # 3. Book it (vehicle optional — pass vin/uuid if we have them, else book on customer)
-    try:
-        result = await mk.create_appointment(
-            dealer,
-            customer_uuid=customer_uuid,
-            vehicle_uuid=vehicle_uuid,
-            vin=req.vin,
-            start=start,
-            service_op=op,
-            phone=req.phone,
-            email=req.email,
-            comments=req.comments or (f"Service requested: {req.service}"),
-        )
-    except mk.MyKaarmaError as e:
-        # SLOT_UNAVAILABLE = that exact time is full → ask for another time
-        if "SLOT_UNAVAILABLE" in (e.body or "") or "NO_TIME_INTERVAL" in (e.body or ""):
-            return {
-                "success": False,
-                "error": "slot_unavailable",
-                "message": "That time isn't available.",
-                "agent_instruction": (
-                    "Let the caller know that time isn't available and ask them to "
-                    "pick a different day or time, then try booking again."
-                ),
-            }
-        log.error("booking failed: %s", e)
-        return _fail("The appointment could not be booked.", "booking_failed")
+    # 3. Book it. If the exact time is full, AUTO-ADVANCE to the next open slot
+    #    (the sandbox has no availability API, so we find an open slot by trying).
+    booked_time = None
+    result = None
+    last_err = None
+    for cand in candidate_times(start, count=16):
+        try:
+            result = await mk.create_appointment(
+                dealer,
+                customer_uuid=customer_uuid,
+                vehicle_uuid=vehicle_uuid,
+                vin=req.vin,
+                start=cand,
+                service_op=op,
+                phone=req.phone,
+                email=req.email,
+                comments=req.comments or (f"Service requested: {req.service}"),
+            )
+            booked_time = cand
+            break
+        except mk.MyKaarmaError as e:
+            last_err = e
+            body = e.body or ""
+            if "SLOT_UNAVAILABLE" in body or "NO_TIME_INTERVAL" in body:
+                continue  # that slot is full — try the next one
+            log.error("booking failed (non-slot error): %s", e)
+            return _fail("The appointment could not be booked.", "booking_failed")
 
-    spoken = _speak_time(start)
-    log.info("BOOKED %s for customer %s", start, customer_uuid)
+    if not booked_time:
+        log.error("no open slot found near %s: %s", start, last_err)
+        return _fail(
+            "I couldn't find an open time near then. Let me have an advisor call you back.",
+            "no_open_slot",
+        )
+
+    spoken = _speak_time(booked_time)
+    log.info("BOOKED %s for customer %s", booked_time, customer_uuid)
 
     return {
         "success": True,
-        "appointment_time": start,
+        "appointment_time": booked_time,
         "spoken_time": spoken,
+        "requested_time": start,
         "customer_uuid": customer_uuid,
         "vehicle_uuid": vehicle_uuid,
         "agent_instruction": (
-            f"Confirm to the customer: 'You're all set for {spoken}.' Then read the "
-            "date and time back once more, and let them know a confirmation is on the way."
+            f"The appointment is booked for {spoken}. Tell the customer: "
+            f"'You're all set for {spoken}.' If that's different from what they asked, "
+            "briefly mention it was the closest opening. Then let them know a "
+            "confirmation is on the way."
         ),
         "mykaarma": result,
     }
