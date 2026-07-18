@@ -275,15 +275,15 @@ async def book_appointment(req: BookRequest):
     except DealerNotConfigured as e:
         return _fail(str(e), "not_configured")
 
-    # 0. Normalise the requested time to ISO (accepts "today 6 PM" etc.)
+    # 0. Normalise the requested time to ISO (accepts "today 6 PM" etc.).
+    #    If it's vague/unparseable ("asap", "soon"), default to the next business slot
+    #    and let the auto-slot-finder book the first opening.
     start = parse_appointment_time(req.appointment_time)
     if not start:
-        return {
-            "success": False,
-            "error": "bad_time",
-            "message": "I couldn't understand that time.",
-            "agent_instruction": "Ask the caller to say the day and time again (e.g. 'tomorrow at 10 AM').",
-        }
+        default_dt = _clamp_business(
+            datetime.now(DEALER_TZ).replace(tzinfo=None) + timedelta(days=1)
+        )
+        start = default_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     customer_uuid = req.customer_uuid
     vehicle_uuid = req.vehicle_uuid
