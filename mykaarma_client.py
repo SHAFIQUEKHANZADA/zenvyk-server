@@ -117,13 +117,30 @@ async def save_customer(
 
 
 def normalize_phone(phone: str) -> str:
-    """myKaarma rejects anything that isn't E.164 (+1XXXXXXXXXX)."""
-    digits = "".join(c for c in str(phone) if c.isdigit())
-    if len(digits) == 10:
+    """
+    myKaarma rejects anything that isn't E.164 (+1XXXXXXXXXX).
+
+    This is a US dealership, so a bare 10-digit number is assumed to be US.
+    We deliberately do NOT slap a "+" on anything else: an earlier version turned
+    "03464365890" into "+03464365890", which is not a valid E.164 number. myKaarma
+    and GHL both accepted it as a distinct value, which created duplicate customer
+    records and broke returning-customer lookup. Better to pass the number through
+    untouched and let it fail loudly than to invent a plausible-looking wrong one.
+    """
+    raw = str(phone).strip()
+    if raw.startswith("+"):
+        return raw
+
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) == 10:                                  # 6305550147 -> US
         return f"+1{digits}"
-    if len(digits) == 11 and digits.startswith("1"):
+    if len(digits) == 11 and digits.startswith("1"):       # 16305550147 -> US
         return f"+{digits}"
-    return phone if str(phone).startswith("+") else f"+{digits}"
+    if len(digits) == 11 and digits.startswith("0"):
+        # National format with a trunk prefix (e.g. 03464365890). We can't know the
+        # country, so don't guess — strip the trunk 0 and return it unprefixed.
+        return digits[1:]
+    return digits or raw
 
 
 def parse_customer(data: dict) -> dict:
