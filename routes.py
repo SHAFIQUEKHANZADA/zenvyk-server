@@ -303,29 +303,70 @@ async def get_slots(req: SlotsRequest):
     except mk.MyKaarmaError:
         return _fail("Could not check the schedule.", "availability_failed")
 
+    # Nothing on the requested day? Don't dead-end the call — look ahead and offer
+    # the next day that HAS openings. Callers routinely ask "when's the first
+    # available?", and a same-day request late in the day always comes back empty.
+    searched_ahead = False
+    if not slots:
+        probe = datetime.strptime(dates[0], "%Y-%m-%d")
+        for _ in range(14):  # up to two weeks out
+            probe += timedelta(days=1)
+            if probe.weekday() == 6:  # closed Sundays
+                continue
+            nxt = probe.strftime("%Y-%m-%d")
+            try:
+                found = await mk.get_availability(
+                    dealer,
+                    dates=[nxt],
+                    customer_uuid=req.customer_uuid,
+                    vehicle_uuid=req.vehicle_uuid,
+                    operation_uuid=op["uuid"] if op else None,
+                )
+            except mk.MyKaarmaError:
+                continue
+            if found:
+                slots, dates, searched_ahead = found, [nxt], True
+                break
+
     if not slots:
         return {
             "success": True,
+            "date": dates[0],
             "slots": [],
             "spoken_slots": [],
             "agent_instruction": (
-                "There are no openings on that day. Ask if another day works, then "
-                "check again."
+                "There are no openings in the next two weeks. Apologise, take a message, "
+                "and let the customer know an advisor will call them back."
             ),
         }
 
     top = slots[:MAX_SLOTS]
-    return {
-        "success": True,
-        "date": dates[0],
-        "slots": top,                                   # ISO — send one of these back to /book
-        "spoken_slots": [_speak_time(s) for s in top],  # what the agent reads out
-        "operation_uuid": op["uuid"] if op else None,
-        "agent_instruction": (
+    spoken_day = datetime.strptime(dates[0], "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
+
+    if searched_ahead:
+        instruction = (
+            f"The day the customer asked for is fully booked. The next day with openings "
+            f"is {spoken_day}. Tell them that day is full, then offer ONLY the times in "
+            f"'spoken_slots' for {spoken_day}. Do NOT invent times. Do NOT transfer — "
+            "keep helping. Once they choose, call book_appointment with the exact "
+            "matching value from 'slots'."
+        )
+    else:
+        instruction = (
             "Offer ONLY these times. Do NOT invent or guess any other time. "
             "Once the customer chooses one, call book_appointment with the exact "
             "matching value from 'slots'."
-        ),
+        )
+
+    return {
+        "success": True,
+        "date": dates[0],
+        "spoken_date": spoken_day,
+        "searched_ahead": searched_ahead,
+        "slots": top,                                   # ISO — send one of these back to /book
+        "spoken_slots": [_speak_time(s) for s in top],  # what the agent reads out
+        "operation_uuid": op["uuid"] if op else None,
+        "agent_instruction": instruction,
     }
 
 
