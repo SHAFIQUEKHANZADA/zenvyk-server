@@ -62,6 +62,57 @@ def parse_appointment_time(raw: str) -> Optional[str]:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_day(raw: str) -> Optional[str]:
+    """
+    Turn whatever the voice agent sends into 'yyyy-MM-dd'.
+
+    The agent is unreliable at date arithmetic and GHL has no {{current_date}}
+    variable, so we resolve it server-side instead. Accepts already-formatted
+    dates, 'today'/'tomorrow', bare weekday names ('Tuesday' -> the NEXT
+    Tuesday, never one in the past), and things like 'July 22'.
+    """
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if DATE_RE.match(raw):
+        return raw
+
+    today = datetime.now(DEALER_TZ).replace(tzinfo=None).date()
+    low = raw.lower().strip()
+
+    if "today" in low:
+        return today.isoformat()
+    if "tomorrow" in low:
+        return (today + timedelta(days=1)).isoformat()
+
+    # bare weekday name -> the next occurrence (today doesn't count)
+    for name, idx in WEEKDAYS.items():
+        if name in low:
+            ahead = (idx - today.weekday()) % 7
+            return (today + timedelta(days=ahead or 7)).isoformat()
+
+    from dateutil import parser as dparser  # lazy import
+
+    try:
+        dt = dparser.parse(raw, default=datetime.combine(today, datetime.min.time()), fuzzy=True)
+    except Exception:
+        return None
+    d = dt.date()
+    if d < today:  # "July 22" when July 22 already passed -> next year
+        try:
+            d = d.replace(year=d.year + 1)
+        except ValueError:
+            return None
+    return d.isoformat()
+
+
 def _clamp_business(dt: datetime) -> datetime:
     """Move dt into business hours (8:00–16:59), skip Sundays, never in the past."""
     now = datetime.now(DEALER_TZ).replace(tzinfo=None)
@@ -94,7 +145,11 @@ class LookupRequest(BaseModel):
 
 class SlotsRequest(BaseModel):
     service: str = Field(..., description="Plain English, e.g. 'oil change'")
-    dates: List[str] = Field(..., description="['2026-07-16'] — yyyy-MM-dd")
+    # The agent may send a real date OR plain words ("tomorrow", "Tuesday").
+    # GHL has no {{current_date}} variable and voice agents are bad at date
+    # arithmetic, so we resolve it here instead. Accepts a list or one string.
+    dates: Optional[List[str]] = None
+    day: Optional[str] = Field(None, description="'tomorrow' | 'Tuesday' | '2026-07-22'")
     customer_uuid: Optional[str] = None
     vehicle_uuid: Optional[str] = None
     dealer_key: Optional[str] = None
@@ -216,26 +271,34 @@ async def get_slots(req: SlotsRequest):
     except DealerNotConfigured as e:
         return _fail(str(e), "not_configured")
 
+    # Resolve whatever the agent sent into real yyyy-MM-dd dates.
+    raw_days = list(req.dates or [])
+    if req.day:
+        raw_days.append(req.day)
+    dates = [d for d in (parse_day(x) for x in raw_days) if d]
+    if not dates:
+        # No usable day — offer the next business day rather than dead-ending.
+        dates = [_clamp_business(
+            datetime.now(DEALER_TZ).replace(tzinfo=None) + timedelta(days=1)
+        ).strftime("%Y-%m-%d")]
+
+    # Match the service to an opcode if we can. If we can't (the sandbox only
+    # has DUMMYOPCODE), still return real availability rather than dead-ending
+    # the call — book_appointment already books without a service line.
+    op = None
     try:
         catalog = await mk.get_opcodes(dealer)
-    except mk.MyKaarmaError as e:
-        return _fail("Could not load the service list.", "opcode_fetch_failed")
-
-    op = mk.match_service(catalog, req.service)
-    if not op:
-        # We do NOT guess a service. Hand off.
-        return _fail(
-            f"'{req.service}' is not a service I can schedule automatically.",
-            "service_not_recognized",
-        )
+        op = mk.match_service(catalog, req.service)
+    except mk.MyKaarmaError:
+        op = None
 
     try:
         slots = await mk.get_availability(
             dealer,
-            dates=req.dates,
+            dates=dates,
             customer_uuid=req.customer_uuid,
             vehicle_uuid=req.vehicle_uuid,
-            operation_uuid=op["uuid"],
+            operation_uuid=op["uuid"] if op else None,
         )
     except mk.MyKaarmaError:
         return _fail("Could not check the schedule.", "availability_failed")
@@ -254,9 +317,10 @@ async def get_slots(req: SlotsRequest):
     top = slots[:MAX_SLOTS]
     return {
         "success": True,
+        "date": dates[0],
         "slots": top,                                   # ISO — send one of these back to /book
         "spoken_slots": [_speak_time(s) for s in top],  # what the agent reads out
-        "operation_uuid": op["uuid"],
+        "operation_uuid": op["uuid"] if op else None,
         "agent_instruction": (
             "Offer ONLY these times. Do NOT invent or guess any other time. "
             "Once the customer chooses one, call book_appointment with the exact "
