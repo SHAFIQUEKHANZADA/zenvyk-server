@@ -418,6 +418,11 @@ async def create_appointment(
     if vin:
         vehicle_info["vin"] = vin
 
+    # confirmationPhoneNumber must be E.164 too — save_customer normalises its copy,
+    # but this one used to go through raw ("8154539364"), so myKaarma had nothing
+    # routable to text.
+    confirmation_phone = normalize_phone(phone) if phone else None
+
     payload = {
         "customerUuid": customer_uuid,
         "vehicleInformation": vehicle_info,
@@ -436,7 +441,7 @@ async def create_appointment(
                 "emailConfirmation": bool(email),
                 "textReminder": bool(phone),
                 "emailReminder": bool(email),
-                "confirmationPhoneNumber": phone,
+                "confirmationPhoneNumber": confirmation_phone,
                 "confirmationEmail": email,
                 "sendCommunicationToDA": True,
             },
