@@ -283,29 +283,73 @@ async def get_availability(
         payload["selectedOperationUuidSet"] = [operation_uuid]
 
     data = await _post(url, dealer, payload, step="get_availability")
-    return _extract_open_slots(data)
+    return _extract_open_slots(data, dates, start_time, end_time)
 
 
-def _extract_open_slots(data: dict) -> List[str]:
+SLOT_MINUTES = 30  # myKaarma's grid ("02:00 PM - 02:29 PM" in its warnings)
+
+
+def _extract_open_slots(
+    data: dict,
+    dates: List[str],
+    start_time: str = "08:00:00",
+    end_time: str = "17:00:00",
+) -> List[str]:
     """
-    availabilityInfoMap:
-        outer key   = date | date-time | "ALL_DATE_TIME"
-        inner key   = "DA={uuid},TO={uuid},TEAM={uuid}"
-        value       = VacancyInfo { vacant: bool, warningMap: {...} }
-    We keep any date-time where at least one combination is vacant.
+    Work out the OPEN times for the requested dates.
+
+    CRITICAL, and we got this backwards for a while (fixed 2026-07-20):
+    `availabilityInfoMap` is the list of **UNAVAILABLE** slots, not the
+    available ones. The docs are explicit — "a map showing which combination
+    of Dealer Associate, Transport Option and Team is *unavailable* when and
+    for what reason." A near-empty map means the store is WIDE OPEN, not full.
+
+    So: build the grid from the dealer's hours of operation, then subtract
+    every slot the response marks blocked (vacant == false).
+
+    Other gotchas, both verified live:
+      * keys come back SPACE-separated — "2026-07-22 14:00:00" — not ISO.
+        create_appointment wants ISO, so we normalise on the way out.
+      * a slot counts as open if ANY DA/TO/TEAM combination is vacant.
     """
-    slots: List[str] = []
     info_map = (data or {}).get("availabilityInfoMap") or {}
 
-    for slot_key, inner in info_map.items():
-        if slot_key == "ALL_DATE_TIME" or "T" not in slot_key:
-            continue  # skip aggregate + date-only keys; we want date-times
-        if isinstance(inner, dict) and any(
-            isinstance(v, dict) and v.get("vacant") for v in inner.values()
-        ):
-            slots.append(slot_key)
+    # Intersect our booking window with the dealer's real hours — never offer a
+    # time outside either. (The sandbox reports 06:00–18:59; we don't want the
+    # voice agent offering a 6 AM oil change.)
+    dealer_start = (data or {}).get("dealerHoursOfOperationStartTime")
+    dealer_end = (data or {}).get("dealerHoursOfOperationEndTime")
+    if dealer_start:
+        start_time = max(start_time, dealer_start)
+    if dealer_end:
+        end_time = min(end_time, dealer_end)
 
-    return sorted(slots)
+    blocked = set()
+    for slot_key, inner in info_map.items():
+        if slot_key == "ALL_DATE_TIME" or not isinstance(inner, dict):
+            continue
+        iso = slot_key.replace(" ", "T")
+        if "T" not in iso:
+            continue  # date-only key, not a time slot
+        # open if at least one combination is vacant; otherwise it's blocked
+        if not any(isinstance(v, dict) and v.get("vacant") for v in inner.values()):
+            blocked.add(iso)
+
+    open_slots: List[str] = []
+    for day in dates:
+        try:
+            t = datetime.strptime(f"{day} {start_time}", "%Y-%m-%d %H:%M:%S")
+            end = datetime.strptime(f"{day} {end_time}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            log.warning("bad date/hours for availability grid: %s", day)
+            continue
+        while t <= end:
+            iso = t.strftime("%Y-%m-%dT%H:%M:%S")
+            if iso not in blocked:
+                open_slots.append(iso)
+            t += timedelta(minutes=SLOT_MINUTES)
+
+    return sorted(open_slots)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
