@@ -143,6 +143,91 @@ def normalize_phone(phone: str) -> str:
     return digits or raw
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. SEARCH CUSTOMER  —  READ-ONLY. Use this to look someone up.
+#
+#     CRITICAL: do NOT use save_customer() to "look up" a caller. It is a WRITE —
+#     searchForDuplicate does not match on phone alone, so every lookup silently
+#     created a brand new blank customer. One test number ended up with 5 records:
+#     4 empty ones from lookups plus the real one from the booking.
+#
+#     VERIFIED LIVE 2026-07-24. Scope customer.search is already granted.
+# ─────────────────────────────────────────────────────────────────────────────
+CUSTOMER_SEARCH_PATH = "/customer/v2/department/{department_uuid}/customer/listMinimal"
+
+
+async def search_customer(
+    dealer: Dict[str, str], phone: Optional[str] = None, term: Optional[str] = None
+) -> List[dict]:
+    """Find existing customers. Returns [] when nobody matches — never creates."""
+    search_term = term or phone
+    if not search_term:
+        return []
+
+    # The stored commValue is whatever was saved (often bare digits), so search on
+    # digits rather than the E.164 form or we miss our own records.
+    if not term and phone:
+        digits = "".join(c for c in str(phone) if c.isdigit())
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        search_term = digits or search_term
+
+    url = MYKAARMA_BASE_URL + CUSTOMER_SEARCH_PATH.format(
+        department_uuid=dealer["department_uuid"]
+    )
+    params = {
+        "searchTerm": search_term,
+        "fieldsToBeSearched": "communications.commValue,fname,lname,vehicles.vin",
+        "maxResults": 25,
+    }
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        r = await client.get(url, headers=headers(dealer), params=params)
+    if r.status_code >= 400:
+        log.error("search_customer -> %s %s", r.status_code, r.text[:300])
+        raise MyKaarmaError(r.status_code, r.text, "search_customer")
+
+    matches = (r.json() or {}).get("matchingCustomers") or []
+    # Prefer records that actually have a name — lookups used to leave blank ones
+    # behind, and greeting a caller off an empty record is worse than not greeting.
+    matches.sort(key=lambda c: (not (c.get("fname") or c.get("lname")),
+                                not c.get("vehicles")))
+    return matches
+
+
+# myKaarma stores placeholder vehicles ("Other", "No Vehicle Selected") when a
+# record was created without real vehicle details. Never read those out loud.
+VEHICLE_JUNK = ("no vehicle selected", "other", "unknown", "n/a", "none")
+
+
+def parse_search_match(match: dict) -> dict:
+    """Flatten one listMinimal result into the shape the voice agent speaks."""
+    vehicles: List[dict] = []
+    for v in match.get("vehicles") or []:
+        make = (v.get("make") or "").strip()
+        model = (v.get("model") or "").strip()
+        if any(j in f"{make} {model}".lower() for j in VEHICLE_JUNK):
+            continue  # placeholder, not a real vehicle
+        label = " ".join(
+            str(x) for x in (v.get("year"), make, model) if x
+        ).strip()
+        if not label and not v.get("vin"):
+            continue
+        vehicles.append(
+            {
+                "vehicle_uuid": v.get("uuid") or v.get("vehicleUuid"),
+                "label": label or v.get("vin"),
+                "vin": v.get("vin"),
+            }
+        )
+    vehicles = vehicles[:2]  # a phone call can't handle a list of five cars
+    return {
+        "customer_uuid": match.get("uuid"),
+        "first_name": (match.get("fname") or "").strip() or None,
+        "last_name": (match.get("lname") or "").strip() or None,
+        "vehicles": vehicles,
+    }
+
+
 def parse_customer(data: dict) -> dict:
     """Flatten myKaarma's customer response into something the voice agent can speak."""
     customer = data.get("customer") or data

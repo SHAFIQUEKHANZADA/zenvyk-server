@@ -216,8 +216,11 @@ async def lookup_customer(req: LookupRequest):
     except DealerNotConfigured as e:
         return _fail(str(e), "not_configured")
 
+    # READ-ONLY search. This used to call save_customer(), which is a WRITE —
+    # it created a fresh blank customer on every lookup instead of finding the
+    # existing one, so returning callers were never recognised.
     try:
-        raw = await mk.save_customer(dealer, phone=req.phone)
+        matches = await mk.search_customer(dealer, phone=req.phone)
     except mk.MyKaarmaError as e:
         log.error("lookup failed: %s", e)
         # Not fatal — the agent can still collect details manually.
@@ -231,7 +234,20 @@ async def lookup_customer(req: LookupRequest):
             ),
         }
 
-    c = mk.parse_customer(raw)
+    if not matches:
+        return {
+            "found": False,
+            "customer_uuid": None,
+            "first_name": None,
+            "last_name": None,
+            "vehicles": [],
+            "agent_instruction": (
+                "No customer record found. Ask for their name and the year, make "
+                "and model of the vehicle."
+            ),
+        }
+
+    c = mk.parse_search_match(matches[0])
     found = bool(c["customer_uuid"] and (c["first_name"] or c["vehicles"]))
 
     if found and c["vehicles"]:
@@ -393,10 +409,18 @@ async def book_appointment(req: BookRequest):
     customer_uuid = req.customer_uuid
     vehicle_uuid = req.vehicle_uuid
 
-    # 1. Create/find the customer if we don't already have a customer_uuid.
-    #    myKaarma can book with just the customerUuid — a vehicle UUID is NOT required
-    #    (verified live: customerUuid + empty vehicleInformation books fine).
-    if not customer_uuid:
+    # 1. ALWAYS save the customer with the full details we collected on the call.
+    #    Earlier this only ran when no customer_uuid was passed — but lookup_customer
+    #    creates a PHONE-ONLY record and hands its uuid to this step, so booking used
+    #    to attach to a nameless record ("customer not in myKaarma by name"). Running
+    #    save_customer with searchForDuplicate=true here matches that same phone record
+    #    and enriches it with the name, email, and vehicle. myKaarma can book with just
+    #    a customerUuid, so we only skip the save if we have literally nothing to add.
+    have_details = any([
+        req.first_name, req.last_name, req.email, req.vin,
+        req.vehicle_year, req.vehicle_make, req.vehicle_model, req.phone,
+    ])
+    if have_details:
         try:
             raw = await mk.save_customer(
                 dealer,
@@ -410,12 +434,16 @@ async def book_appointment(req: BookRequest):
                 vehicle_model=req.vehicle_model,
             )
         except mk.MyKaarmaError:
-            return _fail("Could not create the customer record.", "customer_failed")
+            if not customer_uuid:
+                return _fail("Could not create the customer record.", "customer_failed")
+            raw = None
 
-        c = mk.parse_customer(raw)
-        customer_uuid = c["customer_uuid"]
-        if not vehicle_uuid and c["vehicles"]:
-            vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
+        if raw:
+            c = mk.parse_customer(raw)
+            # Prefer the freshly-saved (named) record's uuid over a bare lookup uuid.
+            customer_uuid = c["customer_uuid"] or customer_uuid
+            if not vehicle_uuid and c["vehicles"]:
+                vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
 
     if not customer_uuid:
         return _fail("I couldn't set up the customer record.", "missing_customer")
