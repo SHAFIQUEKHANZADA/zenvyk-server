@@ -187,10 +187,28 @@ async def search_customer(
         raise MyKaarmaError(r.status_code, r.text, "search_customer")
 
     matches = (r.json() or {}).get("matchingCustomers") or []
-    # Prefer records that actually have a name — lookups used to leave blank ones
-    # behind, and greeting a caller off an empty record is worse than not greeting.
-    matches.sort(key=lambda c: (not (c.get("fname") or c.get("lname")),
-                                not c.get("vehicles")))
+
+    # A real dealership WILL have duplicate records on one phone number, so pick
+    # deterministically: the most complete record wins, ties go to the most
+    # recently created (highest id). Without this the API's arbitrary ordering
+    # made Esther greet callers off whichever stub record came back first.
+    def completeness(c: dict) -> tuple:
+        real_vehicles = [
+            v for v in (c.get("vehicles") or [])
+            if not any(j in f"{v.get('make') or ''} {v.get('model') or ''}".lower()
+                       for j in VEHICLE_JUNK)
+        ]
+        score = 0
+        if (c.get("fname") or "").strip():
+            score += 2
+        if (c.get("lname") or "").strip():
+            score += 1
+        score += len(real_vehicles)
+        if any((k.get("commType") == "E") for k in (c.get("communications") or [])):
+            score += 1
+        return (score, c.get("id") or 0)  # higher score, then newer record
+
+    matches.sort(key=completeness, reverse=True)
     return matches
 
 
