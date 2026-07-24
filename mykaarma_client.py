@@ -445,7 +445,9 @@ def _extract_open_slots(
         except ValueError:
             log.warning("bad date/hours for availability grid: %s", day)
             continue
-        while t <= end:
+        # `t < end`, not `<=` — never offer an appointment at the exact closing
+        # time. Sunday closes at 4 PM, so the last bookable slot is 3:30 PM.
+        while t < end:
             iso = t.strftime("%Y-%m-%dT%H:%M:%S")
             if iso not in blocked:
                 open_slots.append(iso)
@@ -465,6 +467,53 @@ def _extract_open_slots(
 APPOINTMENT_PATH = "/appointment/v2/dealer/{dealer_uuid}/appointment"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSPORT OPTIONS  ("waiting" / "drop off" / "shuttle" / "loaner")
+#
+# myKaarma exposes the UUIDs in the availability response but NAMING them needs
+# GET /scheduler/v2/department/{dept}/transportOption, which returns HTML for us
+# — that scope isn't granted yet (ask Sudhanshu). Until it is, fill this map by
+# booking one appointment per UUID and reading the "Transportation Option:" line
+# in the confirmation email.
+#
+# Leave a value as None and we simply omit transportOption, which is what we did
+# before — myKaarma then defaults it (that's why every appointment came back as
+# "I Will Drop My Vehicle Off" no matter what the caller actually said).
+TRANSPORT_OPTIONS: Dict[str, Optional[str]] = {
+    "waiting": None,
+    "dropoff": None,
+    "shuttle": None,
+    "loaner": None,
+}
+
+# unidentified UUIDs seen on this department, kept so the mapping test is easy
+KNOWN_TRANSPORT_UUIDS = [
+    "CjaK5wAvBDG7Di6XAt6RpllbGtz9SiHoBzM2vDiFa9Q",
+    "-f_LNZEWiHQg4AbTH-b_qmDTO8CKwkSQXCtpYFHfWGw",
+    "recb8K8QYLpT0MQ2RcLZ88KvcIyTYbpi06jGC68FbG0",
+    "qhLQ5MDZWWsZOwy_YEtuvPhz6ZliEkjcrHSqFYdI-o0",
+    "w5fkIJojY4v-pCn0VBtnCur1AsjPwkH2RHUpf89LiMU",
+]
+
+
+def match_transport(spoken: Optional[str]) -> Optional[str]:
+    """'I'll wait for it' -> the waiting UUID. None when we can't tell."""
+    if not spoken:
+        return None
+    s = spoken.lower()
+    if any(w in s for w in ("wait", "waiter", "stay", "sit")):
+        key = "waiting"
+    elif any(w in s for w in ("shuttle", "ride", "drive me", "lift")):
+        key = "shuttle"
+    elif any(w in s for w in ("loaner", "rental", "courtesy")):
+        key = "loaner"
+    elif any(w in s for w in ("drop", "leave", "leaving")):
+        key = "dropoff"
+    else:
+        return None
+    return TRANSPORT_OPTIONS.get(key)
+
+
 async def create_appointment(
     dealer: Dict[str, str],
     customer_uuid: str,
@@ -475,6 +524,7 @@ async def create_appointment(
     phone: Optional[str] = None,
     email: Optional[str] = None,
     comments: Optional[str] = None,
+    transport_option: Optional[str] = None,
 ) -> dict:
     """
     VERIFIED LIVE 2026-07-16 — the endpoint accepts and validates this payload.
@@ -513,7 +563,9 @@ async def create_appointment(
         "vehicleInformation": vehicle_info,
         "appointmentInformation": {
             "appointmentStartDateTime": start,
-            "transportOption": None,
+            # Only send it when we actually know the UUID — sending null lets
+            # myKaarma pick, which is how everything became "drop off".
+            "transportOption": {"uuid": transport_option} if transport_option else None,
             "assignedUser": None,   # myKaarma picks the advisor
             "creatorUser": None,
             "appointmentKey": None,

@@ -113,17 +113,48 @@ def parse_day(raw: str) -> Optional[str]:
     return d.isoformat()
 
 
+# Service-lane hours per Reid, 2026-07-24. Monday=0 … Sunday=6.
+# (open_hour, close_hour) in 24h; close_hour 24 means midnight.
+# The store is open 7 days — an earlier version skipped Sunday entirely, which
+# made Esther refuse a day the dealership is actually open.
+DEALER_HOURS = {
+    0: (6, 24),   # Monday    6:00 AM – midnight
+    1: (0, 24),   # Tuesday   24 hours
+    2: (0, 24),   # Wednesday 24 hours
+    3: (0, 24),   # Thursday  24 hours
+    4: (0, 24),   # Friday    24 hours
+    5: (0, 16),   # Saturday  midnight – 4:00 PM
+    6: (8, 16),   # Sunday    8:00 AM – 4:00 PM
+}
+
+# We never OFFER a 3 AM appointment even on a 24-hour day — myKaarma's own
+# configured hours cap this anyway, and nobody wants a call offering 2 AM.
+SPEAKABLE_START = 8
+SPEAKABLE_END = 17
+
+
+def day_hours(dt: datetime) -> tuple:
+    """Bookable (open_hour, close_hour) for that weekday, clamped to sane times."""
+    open_h, close_h = DEALER_HOURS.get(dt.weekday(), (8, 17))
+    return max(open_h, SPEAKABLE_START), min(close_h, SPEAKABLE_END)
+
+
 def _clamp_business(dt: datetime) -> datetime:
-    """Move dt into business hours (8:00–16:59), skip Sundays, never in the past."""
+    """Move dt into the dealership's real hours for that day, never in the past."""
     now = datetime.now(DEALER_TZ).replace(tzinfo=None)
     if dt < now:
         dt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    if dt.hour < 8:
-        dt = dt.replace(hour=8, minute=0, second=0, microsecond=0)
-    if dt.hour >= 17:
-        dt = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
-    if dt.weekday() == 6:  # Sunday
-        dt = (dt + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+
+    for _ in range(8):  # at most a week of rolling forward
+        open_h, close_h = day_hours(dt)
+        if dt.hour < open_h:
+            dt = dt.replace(hour=open_h, minute=0, second=0, microsecond=0)
+        if dt.hour >= close_h:
+            dt = dt + timedelta(days=1)
+            open_h, _ = day_hours(dt)
+            dt = dt.replace(hour=open_h, minute=0, second=0, microsecond=0)
+            continue
+        return dt
     return dt
 
 
@@ -171,6 +202,8 @@ class BookRequest(BaseModel):
     vehicle_make: Optional[str] = None
     vehicle_model: Optional[str] = None
     comments: Optional[str] = None
+    # what the caller said in the transport step: "waiting" / "dropping it off" / "shuttle"
+    transport: Optional[str] = None
     dealer_key: Optional[str] = None
 
 
@@ -308,6 +341,10 @@ async def get_slots(req: SlotsRequest):
     except mk.MyKaarmaError:
         op = None
 
+    # Use that specific day's opening hours — Saturday and Sunday close at 4 PM.
+    _d = datetime.strptime(dates[0], "%Y-%m-%d")
+    _open, _close = day_hours(_d)
+
     try:
         slots = await mk.get_availability(
             dealer,
@@ -315,6 +352,8 @@ async def get_slots(req: SlotsRequest):
             customer_uuid=req.customer_uuid,
             vehicle_uuid=req.vehicle_uuid,
             operation_uuid=op["uuid"] if op else None,
+            start_time=f"{_open:02d}:00:00",
+            end_time=f"{_close:02d}:00:00",
         )
     except mk.MyKaarmaError:
         return _fail("Could not check the schedule.", "availability_failed")
@@ -327,8 +366,6 @@ async def get_slots(req: SlotsRequest):
         probe = datetime.strptime(dates[0], "%Y-%m-%d")
         for _ in range(14):  # up to two weeks out
             probe += timedelta(days=1)
-            if probe.weekday() == 6:  # closed Sundays
-                continue
             nxt = probe.strftime("%Y-%m-%d")
             try:
                 found = await mk.get_availability(
@@ -459,6 +496,13 @@ async def book_appointment(req: BookRequest):
 
     # 3. Book it. If the exact time is full, AUTO-ADVANCE to the next open slot
     #    (the sandbox has no availability API, so we find an open slot by trying).
+    # Always write the caller's transport choice into the notes. The structured
+    # transportOption field needs UUIDs we can't name yet (scope pending), so
+    # without this the advisor has no idea the customer said they'd be waiting.
+    note = req.comments or f"Service requested: {req.service}"
+    if req.transport:
+        note = f"{note} | Transport: {req.transport}"
+
     booked_time = None
     result = None
     last_err = None
@@ -473,7 +517,8 @@ async def book_appointment(req: BookRequest):
                 service_op=op,
                 phone=req.phone,
                 email=req.email,
-                comments=req.comments or (f"Service requested: {req.service}"),
+                comments=note,
+                transport_option=mk.match_transport(req.transport),
             )
             booked_time = cand
             break
