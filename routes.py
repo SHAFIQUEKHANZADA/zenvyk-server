@@ -558,6 +558,34 @@ async def book_appointment(req: BookRequest):
 
 
 # ─────────────────────────────────────────────────────────────
+# REVIEW SYNC — poll myKaarma for closed ROs, push each to a GHL webhook
+# so GHL can fire its review-request workflow. Call this on a schedule
+# (e.g. an external cron / Railway cron hitting it every 15 minutes).
+# ─────────────────────────────────────────────────────────────
+@router.post("/sync-reviews")
+async def sync_reviews(dealer_key: Optional[str] = None, webhook_url: Optional[str] = None):
+    import os
+    import review_sync
+
+    try:
+        dealer = get_dealer(dealer_key)
+    except DealerNotConfigured as e:
+        return _fail(str(e), "not_configured")
+
+    url = webhook_url or os.getenv("GHL_REVIEW_WEBHOOK_URL")
+    if not url:
+        return _fail("No GHL review webhook URL configured.", "no_webhook")
+
+    try:
+        result = await review_sync.sync_closed_ros(dealer, url)
+    except mk.MyKaarmaError as e:
+        log.error("review sync failed: %s", e)
+        return _fail("Could not read closed repair orders.", "order_search_failed")
+
+    return {"success": True, **result}
+
+
+# ─────────────────────────────────────────────────────────────
 # Utility: refresh the cached opcode catalogue
 # ─────────────────────────────────────────────────────────────
 @router.post("/refresh-opcodes")

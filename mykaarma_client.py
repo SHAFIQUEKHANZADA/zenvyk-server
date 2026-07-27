@@ -164,12 +164,14 @@ async def search_customer(
     if not search_term:
         return []
 
-    # The stored commValue is whatever was saved (often bare digits), so search on
-    # digits rather than the E.164 form or we miss our own records.
+    # The stored commValue is whatever was saved (usually bare digits), so search
+    # on digits, not the E.164 form. This MUST strip the same prefixes that
+    # normalize_phone() strips on the way in — otherwise we save "3464365890" and
+    # then search "03464365890" and never find our own record.
     if not term and phone:
         digits = "".join(c for c in str(phone) if c.isdigit())
-        if len(digits) == 11 and digits.startswith("1"):
-            digits = digits[1:]
+        if len(digits) == 11 and digits[0] in ("1", "0"):
+            digits = digits[1:]          # US country code or national trunk prefix
         search_term = digits or search_term
 
     url = MYKAARMA_BASE_URL + CUSTOMER_SEARCH_PATH.format(
