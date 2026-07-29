@@ -132,14 +132,19 @@ def normalize_phone(phone: str) -> str:
         return raw
 
     digits = "".join(c for c in raw if c.isdigit())
+
+    # National format with a trunk prefix (e.g. someone dictates "0 302 331 3380").
+    # Drop the single leading trunk 0 so the real 10-digit number is left.
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+
     if len(digits) == 10:                                  # 6305550147 -> US
         return f"+1{digits}"
     if len(digits) == 11 and digits.startswith("1"):       # 16305550147 -> US
         return f"+{digits}"
-    if len(digits) == 11 and digits.startswith("0"):
-        # National format with a trunk prefix (e.g. 03464365890). We can't know the
-        # country, so don't guess — strip the trunk 0 and return it unprefixed.
-        return digits[1:]
+    # Anything else is unusual for a US dealership. Return the digits untouched
+    # rather than inventing a country code — better to fail loudly than to store a
+    # plausible-looking wrong number. (We do NOT prefix "+0..." — myKaarma rejects it.)
     return digits or raw
 
 
