@@ -309,11 +309,18 @@ async def get_opcodes(dealer: Dict[str, str], force: bool = False) -> Dict[str, 
             (op.get("opCodeName") or "").strip().lower(),
             (op.get("laborOpCode") or "").strip().lower(),
         }
+        # full searchable text for keyword matching (real opcodes have verbose DMS
+        # descriptions like "MCGRATH ADVANTAGE OIL AND FILTER CHANGE AND TIRE ROTATION")
+        searchtext = " ".join(
+            str(x) for x in (op.get("description"), op.get("opCodeName"), op.get("laborOpCode"))
+            if x
+        ).lower()
         entry = {
             "uuid": op.get("uuid"),
             "laborOpCode": op.get("laborOpCode"),
             "minutes": op.get("opCodeDurationInMinutes"),
             "name": op.get("description") or op.get("opCodeName"),
+            "searchtext": searchtext,
         }
         for n in names:
             if n:
@@ -324,24 +331,89 @@ async def get_opcodes(dealer: Dict[str, str], force: bool = False) -> Dict[str, 
     return catalog
 
 
+# What a caller might say -> keywords to look for in the opcode's full text.
+# Real dealer opcodes have verbose descriptions ("B-1/ 7500 MILE SERVICE", "MCGRATH
+# ADVANTAGE OIL AND FILTER CHANGE"), so plain word-matching misses them. These map
+# everyday phrases to the words that actually appear in those descriptions.
+SERVICE_KEYWORDS = {
+    "oil change": ["oil"], "oil": ["oil"], "oil and filter": ["oil"],
+    "tire rotation": ["rotation", "rotate"], "rotation": ["rotation"], "rotate": ["rotate"],
+    "alignment": ["align"], "align": ["align"], "wheel alignment": ["align"],
+    "battery": ["battery"],
+    "brake": ["brake"], "brakes": ["brake"],
+    "tire light": ["tire light", "tire pressure"],
+    "new tires": ["mount", "balance", "new tires"], "mount tires": ["mount", "balance"],
+    "tires": ["tire"], "tire": ["tire"],
+    "b1": ["b-1", "b1", "7500"], "b 1": ["b-1", "7500"], "b-1": ["b-1", "7500"],
+    "a1": ["a-1", '"a"', "a serv"], "a 1": ["a-1", "a serv"], "a-1": ["a-1", "a serv"],
+    "b16": ["b-1"], "maintenance": ["maintenance", "service"],
+}
+
+
+def _norm(s: str) -> str:
+    return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
 def match_service(catalog: Dict[str, dict], service: str) -> Optional[dict]:
     """
-    Map plain English -> an opcode.
-    Deliberately conservative: if we can't match it, return None and the
-    caller transfers to a human. We do NOT guess a service.
+    Map plain English -> an opcode. Tries, in order:
+      1. exact catalog key
+      2. normalized code match (so "B1" == "B-1")
+      3. keyword match against the opcode's full description text
+      4. substring / word overlap
+    Returns None only if nothing plausibly matches (caller then books without a
+    service line rather than guessing wrong).
     """
     s = (service or "").strip().lower()
     if not s:
         return None
-    if s in catalog:
+
+    # dedupe entries (catalog is keyed by multiple names -> same entry) and drop
+    # placeholder/dummy opcodes so they never win a match
+    ops = [
+        op for op in {op["uuid"]: op for op in catalog.values()}.values()
+        if "dummy" not in (op.get("laborOpCode") or "").lower()
+        and "dummy" not in (op.get("name") or "").lower()
+    ]
+
+    # 1. exact
+    if s in catalog and "dummy" not in (catalog[s].get("laborOpCode") or "").lower():
         return catalog[s]
-    for name, op in catalog.items():
-        if s in name or name in s:
+
+    # 2. normalized code match (B1 <-> B-1). Honda maintenance codes (A1, B1, A16...)
+    # are short — match an opcode whose code equals or ends with it (99A1 -> "a1").
+    sn = _norm(s)
+    if sn:
+        for op in ops:
+            if sn == _norm(op.get("laborOpCode")):
+                return op
+        if len(sn) <= 4:
+            suffix = [op for op in ops if _norm(op.get("laborOpCode")).endswith(sn)]
+            if suffix:
+                # shortest code = closest to the bare Honda code (99A1 beats 99MCGADVA1)
+                return min(suffix, key=lambda op: len(op.get("laborOpCode") or ""))
+
+    # 3. keyword match against full opcode text
+    keywords = SERVICE_KEYWORDS.get(s)
+    if not keywords:
+        for phrase, kws in SERVICE_KEYWORDS.items():
+            if phrase in s or s in phrase:
+                keywords = kws
+                break
+    if keywords:
+        for op in ops:
+            text = op.get("searchtext", "")
+            if any(kw in text for kw in keywords):
+                return op
+
+    # 4. substring / word overlap fallback
+    for op in ops:
+        name = (op.get("name") or "").lower()
+        if name and (s in name or name in s):
             return op
-    # loose word overlap as a last resort
     words = set(s.split())
-    for name, op in catalog.items():
-        if words & set(name.split()):
+    for op in ops:
+        if words & set((op.get("searchtext") or "").split()):
             return op
     return None
 

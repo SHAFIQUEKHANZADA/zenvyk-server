@@ -485,6 +485,32 @@ async def book_appointment(req: BookRequest):
     if not customer_uuid:
         return _fail("I couldn't set up the customer record.", "missing_customer")
 
+    # 1b. Get the vehicle UUID so it ATTACHES to the appointment.
+    #     save_customer creates the vehicle but does NOT return its uuid, so the
+    #     appointment used to book with an empty vehicle → "Not selected at booking"
+    #     in the DMS/dispatch. The customer search DOES return vehicle uuids, so look
+    #     the customer back up and grab the vehicle that matches what they told us.
+    if not vehicle_uuid and req.phone:
+        try:
+            matches = await mk.search_customer(dealer, phone=req.phone)
+        except mk.MyKaarmaError:
+            matches = []
+        # ONLY use a vehicle that belongs to the SAME customer we're booking under.
+        # This phone may have duplicate customer records; a vehicle from a different
+        # record fails with VEHICLE_UUID_NOT_FOUND.
+        for m in matches:
+            if m.get("uuid") != customer_uuid:
+                continue
+            for v in mk.parse_search_match(m)["vehicles"]:
+                label = (v.get("label") or "").lower()
+                want = " ".join(
+                    str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
+                ).lower()
+                if not want or all(w in label for w in want.split() if w):
+                    vehicle_uuid = v["vehicle_uuid"]
+                    break
+            break
+
     # 2. Try to resolve the service to a real opcode. If it doesn't match
     #    (e.g. sandbox only has DUMMYOPCODE), book WITHOUT a service line — don't fail.
     op = None
@@ -527,6 +553,13 @@ async def book_appointment(req: BookRequest):
             body = e.body or ""
             if "SLOT_UNAVAILABLE" in body or "NO_TIME_INTERVAL" in body:
                 continue  # that slot is full — try the next one
+            if "VEHICLE_UUID_NOT_FOUND" in body and vehicle_uuid:
+                # The vehicle didn't belong to this customer — book WITHOUT it rather
+                # than failing the whole appointment. Better a booking with no vehicle
+                # attached than no booking at all.
+                log.warning("vehicle %s rejected; retrying without it", vehicle_uuid)
+                vehicle_uuid = None
+                continue
             log.error("booking failed (non-slot error): %s", e)
             return _fail("The appointment could not be booked.", "booking_failed")
 
