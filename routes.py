@@ -132,6 +132,11 @@ DEALER_HOURS = {
 SPEAKABLE_START = 8
 SPEAKABLE_END = 17
 
+# Never offer a slot that starts sooner than this many minutes from now (dealer-
+# local). Without this, a same-day call in the evening is still offered that
+# morning's times — myKaarma returns the whole day's grid regardless of the clock.
+SLOT_LEAD_MINUTES = 30
+
 
 def day_hours(dt: datetime) -> tuple:
     """Bookable (open_hour, close_hour) for that weekday, clamped to sane times."""
@@ -358,6 +363,14 @@ async def get_slots(req: SlotsRequest):
     except mk.MyKaarmaError:
         return _fail("Could not check the schedule.", "availability_failed")
 
+    # Drop any slot already in the past (or too soon) in the dealer's local time.
+    # myKaarma hands back the whole day's grid with no regard for the current clock,
+    # so a 10 PM "today" request would otherwise be offered 8 AM–4 PM slots that have
+    # all passed. Future dates are untouched — every one of their slots is > now.
+    now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+    earliest = now_local + timedelta(minutes=SLOT_LEAD_MINUTES)
+    slots = [s for s in slots if datetime.fromisoformat(s) > earliest]
+
     # Nothing on the requested day? Don't dead-end the call — look ahead and offer
     # the next day that HAS openings. Callers routinely ask "when's the first
     # available?", and a same-day request late in the day always comes back empty.
@@ -398,11 +411,12 @@ async def get_slots(req: SlotsRequest):
 
     if searched_ahead:
         instruction = (
-            f"The day the customer asked for is fully booked. The next day with openings "
-            f"is {spoken_day}. Tell them that day is full, then offer ONLY the times in "
-            f"'spoken_slots' for {spoken_day}. Do NOT invent times. Do NOT transfer — "
-            "keep helping. Once they choose, call book_appointment with the exact "
-            "matching value from 'slots'."
+            f"The day the customer asked for has no more available times (fully booked, "
+            f"or it's already too late in the day). The next day with openings is "
+            f"{spoken_day}. Let them know that day isn't available, then offer ONLY the "
+            f"times in 'spoken_slots' for {spoken_day}. Do NOT invent times. Do NOT "
+            "transfer — keep helping. Once they choose, call book_appointment with the "
+            "exact matching value from 'slots'."
         )
     else:
         instruction = (
