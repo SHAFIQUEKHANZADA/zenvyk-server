@@ -441,6 +441,8 @@ async def get_availability(
     vehicle_uuid: Optional[str] = None,
     operation_uuid: Optional[str] = None,
     vin: Optional[str] = None,
+    transport_option_uuid: Optional[str] = None,
+    existing_appointment_uuid: Optional[str] = None,
     start_time: str = "08:00:00",
     end_time: str = "19:00:00",
 ) -> List[str]:
@@ -448,12 +450,26 @@ async def get_availability(
     VERIFIED LIVE 2026-07-16 — structure below matches the docs exactly.
     IMPORTANT: customerInformation/vehicleInformation use the key "uuid",
     NOT "customerUuid"/"vehicleUuid" (that mistake returns a 500).
+
+    myKaarma certification (Aug 2026):
+      - do NOT send startTime/endTime — myKaarma determines the window itself.
+        (We still bound the SPOKEN grid locally in _extract_open_slots.)
+      - send the chosen transportOptionUuidList so availability is correct and
+        the follow-on create-appointment call doesn't fail.
+      - send existingAppointmentUuid when fetching slots for an appointment UPDATE.
     """
     url = MYKAARMA_BASE_URL + AVAILABILITY_PATH.format(
         department_uuid=dealer["department_uuid"]
     )
 
-    empty_attrs = {
+    # The customer's chosen transport goes in selectedAvailabilityAttributes.
+    selected_attrs = {
+        "dealerAssociateUuidList": [],
+        "transportOptionUuidList": [transport_option_uuid] if transport_option_uuid else [],
+        "teamUuidList": [],
+        "subTransportOptionUuidList": [],
+    }
+    all_attrs = {
         "dealerAssociateUuidList": [],
         "transportOptionUuidList": [],
         "teamUuidList": [],
@@ -463,10 +479,8 @@ async def get_availability(
     payload: Dict[str, Any] = {
         "platform": {"name": "Web"},
         "dates": dates,
-        "startTime": start_time,
-        "endTime": end_time,
-        "selectedAvailabilityAttributes": dict(empty_attrs),
-        "allAvailabilityAttributes": dict(empty_attrs),
+        "selectedAvailabilityAttributes": selected_attrs,
+        "allAvailabilityAttributes": all_attrs,
         "fetchAvailability": True,
     }
     if customer_uuid:
@@ -480,6 +494,8 @@ async def get_availability(
         payload["vehicleInformation"] = vi
     if operation_uuid:
         payload["selectedOperationUuidSet"] = [operation_uuid]
+    if existing_appointment_uuid:
+        payload["existingAppointmentUuid"] = existing_appointment_uuid
 
     data = await _post(url, dealer, payload, step="get_availability")
     return _extract_open_slots(data, dates, start_time, end_time)

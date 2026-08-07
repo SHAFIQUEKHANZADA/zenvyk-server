@@ -188,6 +188,8 @@ class SlotsRequest(BaseModel):
     day: Optional[str] = Field(None, description="'tomorrow' | 'Tuesday' | '2026-07-22'")
     customer_uuid: Optional[str] = None
     vehicle_uuid: Optional[str] = None
+    # what the caller chose in the transport step ("shuttle"/"loaner"/"waiting"/"drop off")
+    transport: Optional[str] = None
     dealer_key: Optional[str] = None
 
 
@@ -350,6 +352,10 @@ async def get_slots(req: SlotsRequest):
     _d = datetime.strptime(dates[0], "%Y-%m-%d")
     _open, _close = day_hours(_d)
 
+    # myKaarma cert: send the caller's chosen transport so availability matches what
+    # the create-appointment call will book (avoids create failures).
+    transport_uuid = mk.match_transport(req.transport)
+
     try:
         slots = await mk.get_availability(
             dealer,
@@ -357,6 +363,7 @@ async def get_slots(req: SlotsRequest):
             customer_uuid=req.customer_uuid,
             vehicle_uuid=req.vehicle_uuid,
             operation_uuid=op["uuid"] if op else None,
+            transport_option_uuid=transport_uuid,
             start_time=f"{_open:02d}:00:00",
             end_time=f"{_close:02d}:00:00",
         )
@@ -387,6 +394,7 @@ async def get_slots(req: SlotsRequest):
                     customer_uuid=req.customer_uuid,
                     vehicle_uuid=req.vehicle_uuid,
                     operation_uuid=op["uuid"] if op else None,
+                    transport_option_uuid=transport_uuid,
                 )
             except mk.MyKaarmaError:
                 continue
