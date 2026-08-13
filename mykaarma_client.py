@@ -49,6 +49,15 @@ async def _get(url: str, dealer: Dict[str, str], step: str) -> dict:
     return r.json() if r.text else {}
 
 
+async def _patch(url: str, dealer: Dict[str, str], payload: dict, step: str) -> dict:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        r = await client.patch(url, headers=headers(dealer), json=payload)
+    if r.status_code >= 400:
+        log.error("%s -> %s %s", step, r.status_code, r.text[:500])
+        raise MyKaarmaError(r.status_code, r.text, step)
+    return r.json() if r.text else {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CUSTOMER  —  Save Customer with searchForDuplicate=true
 #    Finds an existing customer OR creates one.
@@ -833,3 +842,76 @@ def upcoming_appointments(appts: List[dict], now_local: datetime) -> List[dict]:
         dated.append((dt, a))
     dated.sort(key=lambda x: x[0])
     return [parse_appointment(a) for _dt, a in dated]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE / CANCEL AN APPOINTMENT  (true reschedule)
+#     PATCH /appointment/v2/department/{dept}/appointment/{appointmentUuid}
+#     scope: appointment.create  (already granted — same as create)
+#
+# PATCH = send only the fields you're changing. Reschedule updates the ONE
+# existing appointment in place (new time / vehicle / service / transport) so we
+# never leave a duplicate behind. Cancel flips status to CANCELLED.
+#
+# NOTE: "Services present in create but not in update are marked invalid" — so
+# when we change the service we send the COMPLETE new service list.
+# ─────────────────────────────────────────────────────────────────────────────
+UPDATE_APPOINTMENT_PATH = (
+    "/appointment/v2/department/{department_uuid}/appointment/{appointment_uuid}"
+)
+
+
+async def update_appointment(
+    dealer: Dict[str, str],
+    appointment_uuid: str,
+    *,
+    start: Optional[str] = None,
+    vehicle_uuid: Optional[str] = None,
+    vin: Optional[str] = None,
+    service_op: Optional[dict] = None,
+    transport_option: Optional[str] = None,
+    comments: Optional[str] = None,
+) -> dict:
+    """Move/modify an existing appointment in place. Only sends changed fields."""
+    url = MYKAARMA_BASE_URL + UPDATE_APPOINTMENT_PATH.format(
+        department_uuid=dealer["department_uuid"],
+        appointment_uuid=appointment_uuid,
+    )
+
+    appt_info: Dict[str, Any] = {}
+    if start:
+        appt_info["appointmentStartDateTime"] = start
+    if transport_option:
+        appt_info["transportOption"] = {"transportOptionUuid": transport_option}
+    if comments:
+        appt_info["comments"] = comments
+    if service_op:
+        appt_info["serviceList"] = [
+            {
+                "title": service_op.get("laborOpCode"),
+                "operationUuid": service_op.get("uuid"),
+                "operationType": "OPCODE",
+                "isCustomConcern": False,
+            }
+        ]
+
+    payload: Dict[str, Any] = {"appointmentInformation": appt_info}
+    if vehicle_uuid or vin:
+        vehicle_info: Dict[str, Any] = {}
+        if vehicle_uuid:
+            vehicle_info["vehicleUuid"] = vehicle_uuid
+        if vin:
+            vehicle_info["vin"] = vin
+        payload["vehicleInformation"] = vehicle_info
+
+    return await _patch(url, dealer, payload, step="update_appointment")
+
+
+async def cancel_appointment(dealer: Dict[str, str], appointment_uuid: str) -> dict:
+    """Cancel an appointment (status -> CANCELLED)."""
+    url = MYKAARMA_BASE_URL + UPDATE_APPOINTMENT_PATH.format(
+        department_uuid=dealer["department_uuid"],
+        appointment_uuid=appointment_uuid,
+    )
+    payload = {"appointmentInformation": {"status": "CANCELLED"}}
+    return await _patch(url, dealer, payload, step="cancel_appointment")

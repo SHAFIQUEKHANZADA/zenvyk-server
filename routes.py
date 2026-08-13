@@ -211,6 +211,10 @@ class BookRequest(BaseModel):
     comments: Optional[str] = None
     # what the caller said in the transport step: "waiting" / "dropping it off" / "shuttle"
     transport: Optional[str] = None
+    # RESCHEDULE: when the caller is moving an existing appointment, pass its UUID
+    # (from lookup-customer's existing_appointment.appointment_uuid). We then UPDATE
+    # that appointment in place instead of creating a new one — no duplicate.
+    reschedule_appointment_uuid: Optional[str] = None
     dealer_key: Optional[str] = None
 
 
@@ -612,20 +616,35 @@ async def book_appointment(req: BookRequest):
     booked_time = None
     result = None
     last_err = None
+    is_reschedule = bool(req.reschedule_appointment_uuid)
+    transport_uuid = await mk.resolve_transport(dealer, req.transport)
     for cand in candidate_times(start, count=16):
         try:
-            result = await mk.create_appointment(
-                dealer,
-                customer_uuid=customer_uuid,
-                vehicle_uuid=vehicle_uuid,
-                vin=req.vin,
-                start=cand,
-                service_op=op,
-                phone=req.phone,
-                email=req.email,
-                comments=note,
-                transport_option=await mk.resolve_transport(dealer, req.transport),
-            )
+            if is_reschedule:
+                # Move the ONE existing appointment in place — no duplicate.
+                result = await mk.update_appointment(
+                    dealer,
+                    req.reschedule_appointment_uuid,
+                    start=cand,
+                    vehicle_uuid=vehicle_uuid,
+                    vin=req.vin,
+                    service_op=op,
+                    transport_option=transport_uuid,
+                    comments=note,
+                )
+            else:
+                result = await mk.create_appointment(
+                    dealer,
+                    customer_uuid=customer_uuid,
+                    vehicle_uuid=vehicle_uuid,
+                    vin=req.vin,
+                    start=cand,
+                    service_op=op,
+                    phone=req.phone,
+                    email=req.email,
+                    comments=note,
+                    transport_option=transport_uuid,
+                )
             booked_time = cand
             break
         except mk.MyKaarmaError as e:
@@ -650,8 +669,14 @@ async def book_appointment(req: BookRequest):
             "no_open_slot",
         )
 
-    spoken = _speak_time(booked_time)
-    log.info("BOOKED %s for customer %s", booked_time, customer_uuid)
+    spoken = _speak_datetime(booked_time)
+    verb = "rescheduled to" if is_reschedule else "booked for"
+    log.info(
+        "%s %s for customer %s",
+        "RESCHEDULED" if is_reschedule else "BOOKED",
+        booked_time,
+        customer_uuid,
+    )
 
     return {
         "success": True,
@@ -660,8 +685,9 @@ async def book_appointment(req: BookRequest):
         "requested_time": start,
         "customer_uuid": customer_uuid,
         "vehicle_uuid": vehicle_uuid,
+        "rescheduled": is_reschedule,
         "agent_instruction": (
-            f"The appointment is booked for {spoken}. Tell the customer: "
+            f"The appointment is {verb} {spoken}. Tell the customer: "
             f"'You're all set for {spoken}.' If that's different from what they asked, "
             "briefly mention it was the closest opening. Then let them know a "
             "confirmation is on the way."
