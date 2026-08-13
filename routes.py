@@ -540,31 +540,38 @@ async def book_appointment(req: BookRequest):
     # duplicate — even if the agent didn't explicitly flag a reschedule. Missed /
     # no-show / past appointments don't count (upcoming_appointments filters them),
     # so those correctly fall through to a brand-new booking.
-    reschedule_uuid = req.reschedule_appointment_uuid
-    if not reschedule_uuid:
-        check_uuid = customer_uuid
-        if not check_uuid and req.phone:
-            try:
-                _ms = await mk.search_customer(dealer, phone=req.phone)
-                if _ms:
-                    check_uuid = mk.parse_search_match(_ms[0])["customer_uuid"]
-            except mk.MyKaarmaError:
-                check_uuid = None
-        if check_uuid:
-            try:
-                _now = datetime.now(DEALER_TZ).replace(tzinfo=None)
-                _existing = mk.upcoming_appointments(
-                    await mk.get_customer_appointments(dealer, check_uuid), _now
+    # We resolve the reschedule target SERVER-SIDE (authoritative) rather than
+    # trusting the agent's existing_appointment_uuid — the voice model sometimes
+    # passes a truncated/blank copy, and a bad UUID makes the update fail (→ the
+    # caller gets transferred). Since a customer may only have ONE appointment, we
+    # look up their real upcoming appointment and update THAT. The agent's value is
+    # only a fallback if we can't resolve one ourselves.
+    reschedule_uuid = None
+    check_uuid = customer_uuid
+    if not check_uuid and req.phone:
+        try:
+            _ms = await mk.search_customer(dealer, phone=req.phone)
+            if _ms:
+                check_uuid = mk.parse_search_match(_ms[0])["customer_uuid"]
+        except mk.MyKaarmaError:
+            check_uuid = None
+    if check_uuid:
+        try:
+            _now = datetime.now(DEALER_TZ).replace(tzinfo=None)
+            _existing = mk.upcoming_appointments(
+                await mk.get_customer_appointments(dealer, check_uuid), _now
+            )
+            if _existing:
+                reschedule_uuid = _existing[0]["appointment_uuid"]
+                log.info(
+                    "reschedule target resolved server-side for customer %s -> %s",
+                    check_uuid, reschedule_uuid,
                 )
-                if _existing:
-                    reschedule_uuid = _existing[0]["appointment_uuid"]
-                    log.info(
-                        "auto-reschedule: customer %s already has an upcoming "
-                        "appointment (%s) — updating it instead of duplicating",
-                        check_uuid, reschedule_uuid,
-                    )
-            except mk.MyKaarmaError as e:
-                log.warning("auto-reschedule check failed: %s", e)
+        except mk.MyKaarmaError as e:
+            log.warning("reschedule lookup failed: %s", e)
+    # fallback: trust the agent's UUID only if we couldn't find one ourselves
+    if not reschedule_uuid and req.reschedule_appointment_uuid:
+        reschedule_uuid = req.reschedule_appointment_uuid
 
     # 1. ALWAYS save the customer with the full details we collected on the call.
     #    Earlier this only ran when no customer_uuid was passed — but lookup_customer
