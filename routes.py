@@ -534,6 +534,38 @@ async def book_appointment(req: BookRequest):
     customer_uuid = req.customer_uuid
     vehicle_uuid = req.vehicle_uuid
 
+    # ── ENFORCE ONE APPOINTMENT PER CUSTOMER ──────────────────────────────────
+    # Business rule: a customer may only have ONE active/upcoming appointment. If
+    # they already have one, we RESCHEDULE (update) it instead of creating a
+    # duplicate — even if the agent didn't explicitly flag a reschedule. Missed /
+    # no-show / past appointments don't count (upcoming_appointments filters them),
+    # so those correctly fall through to a brand-new booking.
+    reschedule_uuid = req.reschedule_appointment_uuid
+    if not reschedule_uuid:
+        check_uuid = customer_uuid
+        if not check_uuid and req.phone:
+            try:
+                _ms = await mk.search_customer(dealer, phone=req.phone)
+                if _ms:
+                    check_uuid = mk.parse_search_match(_ms[0])["customer_uuid"]
+            except mk.MyKaarmaError:
+                check_uuid = None
+        if check_uuid:
+            try:
+                _now = datetime.now(DEALER_TZ).replace(tzinfo=None)
+                _existing = mk.upcoming_appointments(
+                    await mk.get_customer_appointments(dealer, check_uuid), _now
+                )
+                if _existing:
+                    reschedule_uuid = _existing[0]["appointment_uuid"]
+                    log.info(
+                        "auto-reschedule: customer %s already has an upcoming "
+                        "appointment (%s) — updating it instead of duplicating",
+                        check_uuid, reschedule_uuid,
+                    )
+            except mk.MyKaarmaError as e:
+                log.warning("auto-reschedule check failed: %s", e)
+
     # 1. ALWAYS save the customer with the full details we collected on the call.
     #    Earlier this only ran when no customer_uuid was passed — but lookup_customer
     #    creates a PHONE-ONLY record and hands its uuid to this step, so booking used
@@ -549,7 +581,7 @@ async def book_appointment(req: BookRequest):
         req.first_name, req.last_name, req.email, req.vin,
         req.vehicle_year, req.vehicle_make, req.vehicle_model, req.phone,
     ])
-    if have_details and not req.reschedule_appointment_uuid:
+    if have_details and not reschedule_uuid:
         try:
             raw = await mk.save_customer(
                 dealer,
@@ -574,7 +606,7 @@ async def book_appointment(req: BookRequest):
             if not vehicle_uuid and c["vehicles"]:
                 vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
 
-    if not customer_uuid and not req.reschedule_appointment_uuid:
+    if not customer_uuid and not reschedule_uuid:
         return _fail("I couldn't set up the customer record.", "missing_customer")
 
     # 1b. Get the vehicle UUID so it ATTACHES to the appointment.
@@ -582,7 +614,7 @@ async def book_appointment(req: BookRequest):
     #     appointment used to book with an empty vehicle → "Not selected at booking"
     #     in the DMS/dispatch. The customer search DOES return vehicle uuids, so look
     #     the customer back up and grab the vehicle that matches what they told us.
-    if not vehicle_uuid and req.phone and not req.reschedule_appointment_uuid:
+    if not vehicle_uuid and req.phone and not reschedule_uuid:
         try:
             matches = await mk.search_customer(dealer, phone=req.phone)
         except mk.MyKaarmaError:
@@ -624,7 +656,7 @@ async def book_appointment(req: BookRequest):
     booked_time = None
     result = None
     last_err = None
-    is_reschedule = bool(req.reschedule_appointment_uuid)
+    is_reschedule = bool(reschedule_uuid)
     transport_uuid = await mk.resolve_transport(dealer, req.transport)
     for cand in candidate_times(start, count=16):
         try:
@@ -632,7 +664,7 @@ async def book_appointment(req: BookRequest):
                 # Move the ONE existing appointment in place — no duplicate.
                 result = await mk.update_appointment(
                     dealer,
-                    req.reschedule_appointment_uuid,
+                    reschedule_uuid,
                     start=cand,
                     vehicle_uuid=vehicle_uuid,
                     vin=req.vin,
