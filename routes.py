@@ -577,11 +577,16 @@ async def book_appointment(req: BookRequest):
     # NOT need to save/enrich the customer or re-resolve the vehicle by phone. That
     # phone-based save/lookup is what trips over duplicate customer records, so skip
     # it entirely when rescheduling and go straight to the update.
+    # IMPORTANT: only WRITE a customer when we don't already have one. If lookup
+    # already identified the caller (req.customer_uuid is set), we skip save_customer
+    # entirely — that per-booking write is what spawned duplicate records, because
+    # myKaarma's duplicate-matching isn't phone-only and would sometimes create a new
+    # twin instead of matching. A known customer books straight under their record.
     have_details = any([
         req.first_name, req.last_name, req.email, req.vin,
         req.vehicle_year, req.vehicle_make, req.vehicle_model, req.phone,
     ])
-    if have_details and not reschedule_uuid:
+    if have_details and not reschedule_uuid and not req.customer_uuid:
         try:
             raw = await mk.save_customer(
                 dealer,
@@ -601,10 +606,15 @@ async def book_appointment(req: BookRequest):
 
         if raw:
             c = mk.parse_customer(raw)
-            # Prefer the freshly-saved (named) record's uuid over a bare lookup uuid.
-            customer_uuid = c["customer_uuid"] or customer_uuid
-            if not vehicle_uuid and c["vehicles"]:
-                vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
+            # If the agent already identified the customer (lookup handed us a uuid),
+            # book under THAT record. Do NOT let save_customer's duplicate-matching
+            # switch us to a different twin — that's how a "Shafique" lookup ended up
+            # booking under a stale "Ronald" duplicate. Only adopt the saved record's
+            # uuid/vehicle for a brand-new customer we had no uuid for.
+            if not req.customer_uuid:
+                customer_uuid = c["customer_uuid"] or customer_uuid
+                if not vehicle_uuid and c["vehicles"]:
+                    vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
 
     if not customer_uuid and not reschedule_uuid:
         return _fail("I couldn't set up the customer record.", "missing_customer")
