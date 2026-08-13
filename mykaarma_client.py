@@ -717,7 +717,12 @@ async def create_appointment(
             "appointmentStartDateTime": start,
             # Only send it when we actually know the UUID — sending null lets
             # myKaarma pick, which is how everything became "drop off".
-            "transportOption": {"uuid": transport_option} if transport_option else None,
+            # myKaarma's create API expects the key `transportOptionUuid` (NOT
+            # `uuid`); using `uuid` here made myKaarma silently ignore it and
+            # default every appointment to "I Will Drop My Vehicle Off".
+            "transportOption": (
+                {"transportOptionUuid": transport_option} if transport_option else None
+            ),
             "assignedUser": None,   # myKaarma picks the advisor
             "creatorUser": None,
             "appointmentKey": None,
