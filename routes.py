@@ -717,13 +717,29 @@ async def book_appointment(req: BookRequest):
                 vehicle_uuid = None
                 continue
             log.error("booking failed (non-slot error): %s", e)
-            return _fail("The appointment could not be booked.", "booking_failed")
+            return _fail(
+                "The appointment could not be booked.",
+                "booking_failed",
+                debug={
+                    "step": "reschedule" if is_reschedule else "create",
+                    "status": e.status,
+                    "body": (e.body or "")[:400],
+                    "reschedule_uuid": reschedule_uuid,
+                    "cand": cand,
+                },
+            )
 
     if not booked_time:
         log.error("no open slot found near %s: %s", start, last_err)
         return _fail(
             "I couldn't find an open time near then. Let me have an advisor call you back.",
             "no_open_slot",
+            debug={
+                "step": "reschedule" if is_reschedule else "create",
+                "start": start,
+                "last_err": str(last_err)[:400] if last_err else None,
+                "reschedule_uuid": reschedule_uuid,
+            },
         )
 
     spoken = _speak_datetime(booked_time)
