@@ -581,50 +581,89 @@ APPOINTMENT_PATH = "/appointment/v2/dealer/{dealer_uuid}/appointment"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TRANSPORT OPTIONS  ("waiting" / "drop off" / "shuttle" / "loaner")
+# TRANSPORT OPTIONS  ("waiting" / "drop off" / "shuttle" / "loaner" / ...)
 #
-# myKaarma exposes the UUIDs in the availability response but NAMING them needs
-# GET /scheduler/v2/department/{dept}/transportOption, which returns HTML for us
-# — that scope isn't granted yet (ask Sudhanshu). Until it is, fill this map by
-# booking one appointment per UUID and reading the "Transportation Option:" line
-# in the confirmation email.
+# The UUIDs differ per dealer, so we DON'T hardcode them — we fetch them live per
+# department from:
+#     GET /appointment/v2/department/{dept}/transportOption/list
+# (scope: appointment.transportOptions — granted 2026-08-13 by Sudhanshu) and
+# match the caller's spoken choice against the returned optionName.
 #
-# Leave a value as None and we simply omit transportOption, which is what we did
-# before — myKaarma then defaults it (that's why every appointment came back as
-# "I Will Drop My Vehicle Off" no matter what the caller actually said).
-TRANSPORT_OPTIONS: Dict[str, Optional[str]] = {
-    "waiting": None,
-    "dropoff": None,
-    "shuttle": None,
-    "loaner": None,
-}
+# Results are cached per department for the process lifetime — the list is static
+# dealer config, so one fetch per store is plenty.
+#
+# "Drop off" is deliberately NOT matched to a UUID: dropping the vehicle off is
+# myKaarma's default when no transportOption is sent (it shows as "I Will Drop My
+# Vehicle Off"), and dealers don't always have an explicit option for it. So we
+# return None for drop-off and let myKaarma default it.
+TRANSPORT_LIST_PATH = "/appointment/v2/department/{department_uuid}/transportOption/list"
 
-# unidentified UUIDs seen on this department, kept so the mapping test is easy
-KNOWN_TRANSPORT_UUIDS = [
-    "CjaK5wAvBDG7Di6XAt6RpllbGtz9SiHoBzM2vDiFa9Q",
-    "-f_LNZEWiHQg4AbTH-b_qmDTO8CKwkSQXCtpYFHfWGw",
-    "recb8K8QYLpT0MQ2RcLZ88KvcIyTYbpi06jGC68FbG0",
-    "qhLQ5MDZWWsZOwy_YEtuvPhz6ZliEkjcrHSqFYdI-o0",
-    "w5fkIJojY4v-pCn0VBtnCur1AsjPwkH2RHUpf89LiMU",
+_TRANSPORT_CACHE: Dict[str, List[dict]] = {}
+
+# spoken intent -> substrings we look for in the dealer's transportOption names.
+# Ordered by priority; "loaner" is checked before "rental" so "courtesy loaner"
+# doesn't fall through to Rental.
+_TRANSPORT_INTENT = [
+    ("wait",    ("wait", "stay", "sit", "hang")),
+    ("shuttle", ("shuttle", "ride", "drive me", "lift")),
+    ("loaner",  ("loaner", "courtesy")),
+    ("rental",  ("rental", "rent")),
+    ("pickup",  ("pick", "delivery", "deliver")),
 ]
 
 
-def match_transport(spoken: Optional[str]) -> Optional[str]:
-    """'I'll wait for it' -> the waiting UUID. None when we can't tell."""
+async def get_transport_options(dealer: Dict[str, str]) -> List[dict]:
+    """Live list of the dealer's transport options (cached per department)."""
+    dept = dealer["department_uuid"]
+    if dept in _TRANSPORT_CACHE:
+        return _TRANSPORT_CACHE[dept]
+    url = MYKAARMA_BASE_URL + TRANSPORT_LIST_PATH.format(department_uuid=dept)
+    data = await _get(url, dealer, step="get_transport_options")
+    options = [
+        o for o in (data.get("transportOptionList") or [])
+        if not o.get("deleted")
+    ]
+    _TRANSPORT_CACHE[dept] = options
+    return options
+
+
+async def resolve_transport(
+    dealer: Dict[str, str], spoken: Optional[str]
+) -> Optional[str]:
+    """
+    'I'll wait for it' -> the dealer's Will-Wait transportOptionUuid.
+    Returns None for drop-off / unknown, so myKaarma defaults to drop-off.
+    """
     if not spoken:
         return None
     s = spoken.lower()
-    if any(w in s for w in ("wait", "waiter", "stay", "sit")):
-        key = "waiting"
-    elif any(w in s for w in ("shuttle", "ride", "drive me", "lift")):
-        key = "shuttle"
-    elif any(w in s for w in ("loaner", "rental", "courtesy")):
-        key = "loaner"
-    elif any(w in s for w in ("drop", "leave", "leaving")):
-        key = "dropoff"
-    else:
+
+    # drop-off is the default (no UUID) — don't match it to anything.
+    if any(w in s for w in ("drop", "leave", "leaving")) and not any(
+        w in s for w in ("loaner", "rental", "shuttle", "wait")
+    ):
         return None
-    return TRANSPORT_OPTIONS.get(key)
+
+    intent_keys: List[str] = []
+    for _key, needles in _TRANSPORT_INTENT:
+        if any(n in s for n in needles):
+            intent_keys.append(_key)
+    if not intent_keys:
+        return None
+
+    try:
+        options = await get_transport_options(dealer)
+    except MyKaarmaError as e:
+        log.warning("transport option fetch failed (%s) — defaulting to drop-off", e)
+        return None
+
+    for key in intent_keys:
+        needles = dict(_TRANSPORT_INTENT)[key]
+        for opt in options:
+            name = (opt.get("optionName") or opt.get("customName") or "").lower()
+            if any(n in name for n in needles):
+                return opt.get("transportOptionUuid")
+    return None
 
 
 async def create_appointment(
@@ -703,3 +742,89 @@ async def create_appointment(
     }
 
     return await _post(url, dealer, payload, step="create_appointment")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# READ A CUSTOMER'S APPOINTMENTS
+#     GET /appointment/v2/dealerDepartment/{dept}/customer/{customerUuid}
+#     scope: appointment.get  (granted 2026-08-13)
+#
+# Flow: phone -> search_customer -> customerUuid -> this. Lets the agent see if a
+# caller already has an upcoming appointment and offer to confirm/reschedule
+# instead of silently creating a duplicate.
+# ─────────────────────────────────────────────────────────────────────────────
+APPOINTMENTS_PATH = (
+    "/appointment/v2/dealerDepartment/{department_uuid}/customer/{customer_uuid}"
+)
+
+
+async def get_customer_appointments(
+    dealer: Dict[str, str],
+    customer_uuid: str,
+    only_latest: bool = False,
+) -> List[dict]:
+    """Raw serviceAppointments list for a customer (newest myKaarma order)."""
+    url = MYKAARMA_BASE_URL + APPOINTMENTS_PATH.format(
+        department_uuid=dealer["department_uuid"],
+        customer_uuid=customer_uuid,
+    )
+    url += f"?fetchOnlyLatestAppointment={'true' if only_latest else 'false'}"
+    data = await _get(url, dealer, step="get_customer_appointments")
+    return data.get("serviceAppointments") or []
+
+
+def parse_appointment(appt: dict) -> dict:
+    """Flatten one appointment into the shape the voice agent speaks."""
+    veh = appt.get("vehicleInformation") or {}
+    label = " ".join(
+        str(veh.get(k)).strip()
+        for k in ("year", "brand", "model")
+        if veh.get(k) and str(veh.get(k)).strip()
+        and str(veh.get(k)).strip().lower() not in VEHICLE_JUNK
+    ).strip()
+    services = [
+        (s.get("description") or "").strip()
+        for s in (appt.get("serviceList") or [])
+        if (s.get("description") or "").strip()
+    ]
+    transport = (appt.get("transportOption") or {}).get("altTransportation")
+    return {
+        "appointment_uuid": appt.get("uuid"),
+        "start_time": appt.get("startTime"),        # "2026-08-15 10:30:00"
+        "preferred_date": appt.get("preferredDate"),
+        "status": appt.get("newStatus") or appt.get("status"),
+        "transport": transport,
+        "vehicle": label or None,
+        "services": services,
+        "comments": appt.get("comments") or None,
+    }
+
+
+# statuses that mean the appointment is NOT a live upcoming one
+_DEAD_STATUS = ("cancel", "no show", "complete", "closed", "arrived")
+
+
+def upcoming_appointments(appts: List[dict], now_local: datetime) -> List[dict]:
+    """
+    Parsed, soonest-first list of appointments still in the FUTURE and not
+    cancelled/no-show/completed. `now_local` is a naive datetime in dealer time.
+    """
+    dated: List[tuple] = []
+    for a in appts:
+        if a.get("isCancelled"):
+            continue
+        status = (a.get("newStatus") or a.get("status") or "").lower()
+        if any(x in status for x in _DEAD_STATUS):
+            continue
+        raw = a.get("startTime") or a.get("date")
+        if not raw:
+            continue
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+        if dt <= now_local:
+            continue
+        dated.append((dt, a))
+    dated.sort(key=lambda x: x[0])
+    return [parse_appointment(a) for _dt, a in dated]

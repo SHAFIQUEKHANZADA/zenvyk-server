@@ -230,6 +230,36 @@ def _speak_time(iso: str) -> str:
             return iso
 
 
+def _speak_datetime(raw: str) -> str:
+    """
+    '2026-08-15 10:30:00' -> 'tomorrow, Friday, August 15 at 10:30 AM'.
+    Prepends today/tomorrow when it applies (Reid's feedback: say 'today', not
+    just the bare date) and otherwise reads the day naturally.
+    """
+    if not raw:
+        return "your scheduled time"
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            break
+        except (ValueError, TypeError):
+            continue
+    if dt is None:
+        return raw
+    try:
+        body = dt.strftime("%A, %B %-d at %-I:%M %p")
+    except ValueError:  # Windows
+        body = dt.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
+    today = datetime.now(DEALER_TZ).replace(tzinfo=None).date()
+    delta = (dt.date() - today).days
+    if delta == 0:
+        return f"today, {body}"
+    if delta == 1:
+        return f"tomorrow, {body}"
+    return body
+
+
 def _fail(message: str, error: str = "error", **extra):
     """Any failure MUST tell the agent to hand off to a human. Never leave a caller stranded."""
     payload = {
@@ -290,7 +320,33 @@ async def lookup_customer(req: LookupRequest):
     c = mk.parse_search_match(matches[0])
     found = bool(c["customer_uuid"] and (c["first_name"] or c["vehicles"]))
 
-    if found and c["vehicles"]:
+    # Does this caller already have an upcoming appointment? If so, the agent
+    # should offer to confirm/reschedule instead of silently booking a duplicate.
+    existing = None
+    if c["customer_uuid"]:
+        try:
+            appts = await mk.get_customer_appointments(dealer, c["customer_uuid"])
+            now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+            upcoming = mk.upcoming_appointments(appts, now_local)
+            if upcoming:
+                existing = upcoming[0]
+        except mk.MyKaarmaError as e:
+            log.warning("appointment read failed for %s: %s", c["customer_uuid"], e)
+
+    if existing:
+        when = _speak_datetime(existing.get("start_time"))
+        svc = existing["services"][0] if existing.get("services") else "service"
+        veh = existing.get("vehicle")
+        veh_txt = f" for the {veh}" if veh else ""
+        instruction = (
+            f"Greet {c['first_name'] or 'the caller'} by name. They ALREADY have an "
+            f"upcoming appointment{veh_txt} on {when} for {svc}. Do NOT book a new "
+            f"appointment yet — first tell them about this existing appointment and "
+            f"ask if they're calling to confirm it, reschedule it, or book something "
+            f"different. Only create a new appointment if they clearly want an "
+            f"additional/different one."
+        )
+    elif found and c["vehicles"]:
         labels = " or ".join(v["label"] for v in c["vehicles"])
         instruction = (
             f"Greet {c['first_name']} by name and confirm the vehicle: "
@@ -313,6 +369,8 @@ async def lookup_customer(req: LookupRequest):
         "first_name": c["first_name"],
         "last_name": c["last_name"],
         "vehicles": c["vehicles"],
+        "has_existing_appointment": bool(existing),
+        "existing_appointment": existing,
         "agent_instruction": instruction,
     }
 
@@ -354,7 +412,7 @@ async def get_slots(req: SlotsRequest):
 
     # myKaarma cert: send the caller's chosen transport so availability matches what
     # the create-appointment call will book (avoids create failures).
-    transport_uuid = mk.match_transport(req.transport)
+    transport_uuid = await mk.resolve_transport(dealer, req.transport)
 
     try:
         slots = await mk.get_availability(
@@ -566,7 +624,7 @@ async def book_appointment(req: BookRequest):
                 phone=req.phone,
                 email=req.email,
                 comments=note,
-                transport_option=mk.match_transport(req.transport),
+                transport_option=await mk.resolve_transport(dealer, req.transport),
             )
             booked_time = cand
             break
