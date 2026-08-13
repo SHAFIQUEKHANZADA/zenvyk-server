@@ -374,6 +374,10 @@ async def lookup_customer(req: LookupRequest):
         "last_name": c["last_name"],
         "vehicles": c["vehicles"],
         "has_existing_appointment": bool(existing),
+        # Flattened to the TOP level so the agent can pass it straight into
+        # book_appointment's reschedule_appointment_uuid without digging into a
+        # nested object (models drop nested fields across tool calls).
+        "existing_appointment_uuid": existing["appointment_uuid"] if existing else None,
         "existing_appointment": existing,
         "agent_instruction": instruction,
     }
@@ -537,11 +541,15 @@ async def book_appointment(req: BookRequest):
     #    save_customer with searchForDuplicate=true here matches that same phone record
     #    and enriches it with the name, email, and vehicle. myKaarma can book with just
     #    a customerUuid, so we only skip the save if we have literally nothing to add.
+    # On a RESCHEDULE we're just moving an appointment that already exists — we do
+    # NOT need to save/enrich the customer or re-resolve the vehicle by phone. That
+    # phone-based save/lookup is what trips over duplicate customer records, so skip
+    # it entirely when rescheduling and go straight to the update.
     have_details = any([
         req.first_name, req.last_name, req.email, req.vin,
         req.vehicle_year, req.vehicle_make, req.vehicle_model, req.phone,
     ])
-    if have_details:
+    if have_details and not req.reschedule_appointment_uuid:
         try:
             raw = await mk.save_customer(
                 dealer,
@@ -566,7 +574,7 @@ async def book_appointment(req: BookRequest):
             if not vehicle_uuid and c["vehicles"]:
                 vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
 
-    if not customer_uuid:
+    if not customer_uuid and not req.reschedule_appointment_uuid:
         return _fail("I couldn't set up the customer record.", "missing_customer")
 
     # 1b. Get the vehicle UUID so it ATTACHES to the appointment.
@@ -574,7 +582,7 @@ async def book_appointment(req: BookRequest):
     #     appointment used to book with an empty vehicle → "Not selected at booking"
     #     in the DMS/dispatch. The customer search DOES return vehicle uuids, so look
     #     the customer back up and grab the vehicle that matches what they told us.
-    if not vehicle_uuid and req.phone:
+    if not vehicle_uuid and req.phone and not req.reschedule_appointment_uuid:
         try:
             matches = await mk.search_customer(dealer, phone=req.phone)
         except mk.MyKaarmaError:
