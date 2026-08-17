@@ -188,6 +188,10 @@ class SlotsRequest(BaseModel):
     day: Optional[str] = Field(None, description="'tomorrow' | 'Tuesday' | '2026-07-22'")
     customer_uuid: Optional[str] = None
     vehicle_uuid: Optional[str] = None
+    # RESCHEDULE: if the customer is updating an existing appointment, include the
+    # appointment UUID so myKaarma returns the correct reschedule slots instead of
+    # behaving like a new booking.
+    existing_appointment_uuid: Optional[str] = None
     # what the caller chose in the transport step ("shuttle"/"loaner"/"waiting"/"drop off")
     transport: Optional[str] = None
     dealer_key: Optional[str] = None
@@ -430,6 +434,7 @@ async def get_slots(req: SlotsRequest):
             vehicle_uuid=req.vehicle_uuid,
             operation_uuid=op["uuid"] if op else None,
             transport_option_uuid=transport_uuid,
+            existing_appointment_uuid=req.existing_appointment_uuid,
             start_time=f"{_open:02d}:00:00",
             end_time=f"{_close:02d}:00:00",
         )
@@ -461,6 +466,7 @@ async def get_slots(req: SlotsRequest):
                     vehicle_uuid=req.vehicle_uuid,
                     operation_uuid=op["uuid"] if op else None,
                     transport_option_uuid=transport_uuid,
+                    existing_appointment_uuid=req.existing_appointment_uuid,
                 )
             except mk.MyKaarmaError:
                 continue
