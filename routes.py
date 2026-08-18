@@ -387,6 +387,13 @@ async def lookup_customer(req: LookupRequest):
     }
 
 
+def _looks_like_uuid(v: Optional[str]) -> bool:
+    """A real myKaarma appointment UUID is a long token (~43 chars, no spaces).
+    The voice model sometimes maps the spoken day ("today"/"tomorrow") into the
+    existing_appointment_uuid field — reject those so we never send garbage."""
+    return bool(v) and len(v) >= 20 and " " not in v
+
+
 # ─────────────────────────────────────────────────────────────
 # 2. GET SLOTS  — agent calls this once it knows the service + the day
 # ─────────────────────────────────────────────────────────────
@@ -426,6 +433,30 @@ async def get_slots(req: SlotsRequest):
     # the create-appointment call will book (avoids create failures).
     transport_uuid = await mk.resolve_transport(dealer, req.transport)
 
+    # myKaarma cert (reschedule): when this caller already has an upcoming appointment,
+    # myKaarma needs the REAL existingAppointmentUuid on the fetch-slots call so it
+    # returns reschedule slots instead of treating it as a fresh booking. Resolve it
+    # SERVER-SIDE from the customer's own appointment — NOT from req.existing_appointment_uuid,
+    # because the voice model sometimes maps the spoken day ("today") into that field.
+    # The agent's value is only a last-resort fallback, and only if it looks like a UUID.
+    existing_appt_uuid = None
+    if req.customer_uuid:
+        try:
+            _now = datetime.now(DEALER_TZ).replace(tzinfo=None)
+            _existing = mk.upcoming_appointments(
+                await mk.get_customer_appointments(dealer, req.customer_uuid), _now
+            )
+            if _existing:
+                existing_appt_uuid = _existing[0]["appointment_uuid"]
+        except mk.MyKaarmaError as e:
+            log.warning("get_slots reschedule lookup failed: %s", e)
+    if not existing_appt_uuid and _looks_like_uuid(req.existing_appointment_uuid):
+        existing_appt_uuid = req.existing_appointment_uuid
+    if req.existing_appointment_uuid and not _looks_like_uuid(req.existing_appointment_uuid):
+        log.info("ignored malformed existing_appointment_uuid from agent: %r",
+                 req.existing_appointment_uuid)
+    log.info("get_slots existingAppointmentUuid -> %s", existing_appt_uuid)
+
     try:
         slots = await mk.get_availability(
             dealer,
@@ -434,7 +465,7 @@ async def get_slots(req: SlotsRequest):
             vehicle_uuid=req.vehicle_uuid,
             operation_uuid=op["uuid"] if op else None,
             transport_option_uuid=transport_uuid,
-            existing_appointment_uuid=req.existing_appointment_uuid,
+            existing_appointment_uuid=existing_appt_uuid,
             start_time=f"{_open:02d}:00:00",
             end_time=f"{_close:02d}:00:00",
         )
@@ -466,7 +497,7 @@ async def get_slots(req: SlotsRequest):
                     vehicle_uuid=req.vehicle_uuid,
                     operation_uuid=op["uuid"] if op else None,
                     transport_option_uuid=transport_uuid,
-                    existing_appointment_uuid=req.existing_appointment_uuid,
+                    existing_appointment_uuid=existing_appt_uuid,
                 )
             except mk.MyKaarmaError:
                 continue
