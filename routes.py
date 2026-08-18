@@ -545,6 +545,10 @@ async def get_slots(req: SlotsRequest):
         "spoken_slots": [_speak_time(s) for s in top],  # what the agent reads out
         "operation_uuid": op["uuid"] if op else None,
         "agent_instruction": instruction,
+        # diagnostic: the appointment UUID actually sent to myKaarma on this fetch-slots
+        # call (resolved server-side). Confirms reschedules send a real, well-formed UUID
+        # regardless of what the voice model passed. Safe to remove after certification.
+        "existing_appointment_uuid_sent": existing_appt_uuid,
     }
 
 
