@@ -871,6 +871,34 @@ async def book_appointment(req: BookRequest):
 
 
 # ─────────────────────────────────────────────────────────────
+# PER-STORE ROUTES (Method B) — the store is baked into the URL path, so each
+# GHL agent just points to its own endpoint and never has to send a dealer_key
+# in the body. These simply set dealer_key from the path and delegate to the
+# same handlers above. The original body-key routes (Method A) still work.
+#   POST /mykaarma/{dealer_key}/lookup-customer
+#   POST /mykaarma/{dealer_key}/get-slots
+#   POST /mykaarma/{dealer_key}/book-appointment
+# e.g. /mykaarma/mcgrath_honda_elgin/get-slots
+# ─────────────────────────────────────────────────────────────
+@router.post("/{dealer_key}/lookup-customer")
+async def lookup_customer_by_path(dealer_key: str, req: LookupRequest):
+    req.dealer_key = dealer_key
+    return await lookup_customer(req)
+
+
+@router.post("/{dealer_key}/get-slots")
+async def get_slots_by_path(dealer_key: str, req: SlotsRequest):
+    req.dealer_key = dealer_key
+    return await get_slots(req)
+
+
+@router.post("/{dealer_key}/book-appointment")
+async def book_appointment_by_path(dealer_key: str, req: BookRequest):
+    req.dealer_key = dealer_key
+    return await book_appointment(req)
+
+
+# ─────────────────────────────────────────────────────────────
 # REVIEW SYNC — poll myKaarma for closed ROs, push each to a GHL webhook
 # so GHL can fire its review-request workflow. Call this on a schedule
 # (e.g. an external cron / Railway cron hitting it every 15 minutes).
