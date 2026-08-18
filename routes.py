@@ -186,6 +186,9 @@ class SlotsRequest(BaseModel):
     # arithmetic, so we resolve it here instead. Accepts a list or one string.
     dates: Optional[List[str]] = None
     day: Optional[str] = Field(None, description="'tomorrow' | 'Tuesday' | '2026-07-22'")
+    # Caller's TIME-of-day preference, in their own words: "12 PM", "after 2",
+    # "before 11", "morning", "afternoon", "evening". We return slots that match it.
+    time: Optional[str] = Field(None, description="e.g. '12 PM', 'after 2', 'morning', 'evening'")
     customer_uuid: Optional[str] = None
     vehicle_uuid: Optional[str] = None
     # RESCHEDULE: if the customer is updating an existing appointment, include the
@@ -394,6 +397,52 @@ def _looks_like_uuid(v: Optional[str]) -> bool:
     return bool(v) and len(v) >= 20 and " " not in v
 
 
+def _filter_by_time_pref(slots: List[str], pref: Optional[str]) -> List[str]:
+    """Filter ISO slot strings by the caller's spoken time-of-day preference:
+      keywords: 'morning' / 'afternoon' / 'evening' / 'noon'
+      relative: 'after 2', 'before 11', 'past noon'
+      specific: '12 PM', '2:30', 'around 3'
+    Returns the matching slots (chronological). Empty pref → unchanged. A given
+    pref that matches nothing → [] (caller-day fallback is handled in get_slots)."""
+    if not pref or not slots:
+        return slots
+    p = pref.lower()
+    hh_of = lambda s: int(s[11:13])
+    mins_of = lambda s: int(s[11:13]) * 60 + int(s[14:16])
+
+    # "not the morning", "can't do evenings", "avoid afternoon" → invert the range.
+    neg = ("not" in p) or ("n't" in p) or ("avoid" in p) or ("except" in p)
+
+    if "morning" in p:
+        return [s for s in slots if hh_of(s) >= 12] if neg else [s for s in slots if hh_of(s) < 12]
+    if "evening" in p or "night" in p:
+        return [s for s in slots if hh_of(s) < 16] if neg else [s for s in slots if hh_of(s) >= 16]
+    if "afternoon" in p:
+        return ([s for s in slots if not (12 <= hh_of(s) < 17)] if neg
+                else [s for s in slots if 12 <= hh_of(s) < 17])
+    if "noon" in p or "midday" in p or "mid day" in p or "mid-day" in p:
+        return [s for s in slots if 11 <= hh_of(s) <= 13]
+
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?", p)
+    if not m:
+        return slots
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    ap = (m.group(3) or "").replace(".", "")
+    if ap == "pm" and hh != 12:
+        hh += 12
+    elif ap == "am" and hh == 12:
+        hh = 0
+    elif not ap and 1 <= hh <= 7:      # bare "2" at a dealership almost always means 2 PM
+        hh += 12
+    target = hh * 60 + mm
+
+    if any(w in p for w in ("before", "earlier", "by")):
+        return [s for s in slots if mins_of(s) <= target]
+    # "after", "past", "from", or a bare specific time → that time and the next few
+    return [s for s in slots if mins_of(s) >= target]
+
+
 # ─────────────────────────────────────────────────────────────
 # 2. GET SLOTS  — agent calls this once it knows the service + the day
 # ─────────────────────────────────────────────────────────────
@@ -480,6 +529,11 @@ async def get_slots(req: SlotsRequest):
     earliest = now_local + timedelta(minutes=SLOT_LEAD_MINUTES)
     slots = [s for s in slots if datetime.fromisoformat(s) > earliest]
 
+    # Honour the caller's time-of-day preference ("12 PM", "after 2", "evening"…).
+    # Keep the day's raw openings so we can fall back if the preference matches nothing.
+    day_fallback = list(slots)
+    slots = _filter_by_time_pref(slots, req.time)
+
     # Nothing on the requested day? Don't dead-end the call — look ahead and offer
     # the next day that HAS openings. Callers routinely ask "when's the first
     # available?", and a same-day request late in the day always comes back empty.
@@ -501,9 +555,15 @@ async def get_slots(req: SlotsRequest):
                 )
             except mk.MyKaarmaError:
                 continue
+            found = _filter_by_time_pref(found, req.time)
             if found:
                 slots, dates, searched_ahead = found, [nxt], True
                 break
+
+    # Time preference matched nothing in the next two weeks — fall back to the
+    # requested day's earliest openings so the caller still gets times to pick from.
+    if not slots and day_fallback:
+        slots, searched_ahead = day_fallback, False
 
     if not slots:
         return {
