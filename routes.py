@@ -10,6 +10,7 @@ simple inputs and returns simple, speakable outputs. All the UUID juggling,
 JSON parsing and opcode mapping happens here, in code.
 """
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -733,25 +734,40 @@ async def book_appointment(req: BookRequest):
     #     in the DMS/dispatch. The customer search DOES return vehicle uuids, so look
     #     the customer back up and grab the vehicle that matches what they told us.
     if not vehicle_uuid and req.phone and not reschedule_uuid:
-        try:
-            matches = await mk.search_customer(dealer, phone=req.phone)
-        except mk.MyKaarmaError:
-            matches = []
-        # ONLY use a vehicle that belongs to the SAME customer we're booking under.
-        # This phone may have duplicate customer records; a vehicle from a different
-        # record fails with VEHICLE_UUID_NOT_FOUND.
-        for m in matches:
-            if m.get("uuid") != customer_uuid:
-                continue
-            for v in mk.parse_search_match(m)["vehicles"]:
-                label = (v.get("label") or "").lower()
-                want = " ".join(
-                    str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
-                ).lower()
-                if not want or all(w in label for w in want.split() if w):
-                    vehicle_uuid = v["vehicle_uuid"]
-                    break
-            break
+        want = " ".join(
+            str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
+        ).lower()
+        # myKaarma's customer search is eventually consistent: a JUST-created customer +
+        # vehicle often isn't indexed for a second or two, so the first search comes back
+        # empty and the appointment books with no vehicle ("Not selected"). Retry briefly
+        # until the vehicle appears. ONLY use a vehicle on the SAME customer we're booking
+        # under (this phone may have duplicate records — a vehicle from a different record
+        # fails with VEHICLE_UUID_NOT_FOUND), and SKIP the auto-created "No Vehicle
+        # Selected" placeholder — always prefer a real vehicle.
+        for attempt in range(4):
+            try:
+                matches = await mk.search_customer(dealer, phone=req.phone)
+            except mk.MyKaarmaError:
+                matches = []
+            for m in matches:
+                if m.get("uuid") != customer_uuid:
+                    continue
+                real = [
+                    v for v in mk.parse_search_match(m)["vehicles"]
+                    if "no vehicle selected" not in (v.get("label") or "").lower()
+                ]
+                # prefer the vehicle matching what the caller told us; else first real one
+                for v in real:
+                    label = (v.get("label") or "").lower()
+                    if want and all(w in label for w in want.split() if w):
+                        vehicle_uuid = v["vehicle_uuid"]
+                        break
+                if not vehicle_uuid and real:
+                    vehicle_uuid = real[0]["vehicle_uuid"]
+                break
+            if vehicle_uuid:
+                break
+            await asyncio.sleep(1.3)  # let myKaarma index the new customer/vehicle
 
     # 2. Try to resolve the service to a real opcode. If it doesn't match
     #    (e.g. sandbox only has DUMMYOPCODE), book WITHOUT a service line — don't fail.
