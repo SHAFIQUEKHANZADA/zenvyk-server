@@ -63,6 +63,16 @@ DEALERS: Dict[str, Dict[str, str]] = {
         "dealer_uuid": "83abfacbb3e6236122ff808b4a27852bc6968fdb14242c0b796b196d88974cc5",
         "department_uuid": "af7feeebf612aed0c88bbdaadb9e645b6636841f8d171de726e6b99631dbfdc4",
     },
+    "mcgrath_audi_mortongrove": {
+        "name": "Audi Morton Grove",
+        "dealer_uuid": "7d6d5ffe0977a3945184fa9280cd7822f5b1c4f973d8b62aaf97c8c316419799",
+        "department_uuid": "b28c55cfd4f635718d9dae28395a836e6fd2ee7b20e9319c5cc17d8e11d03cf8",
+    },
+    "mcgrath_volvo_barrington": {
+        "name": "McGrath Volvo Cars Barrington",
+        "dealer_uuid": "d968c38c1360dacf3ff2ec6652094444a46a5015eb885252f4b9e67a54f9609b",
+        "department_uuid": "5075ab08a2bee027cb98d846b916b2dc10303a3b7b2d594b37f5822fe93580c7",
+    },
     "sandbox": {
         "name": "McGrath Motors Sandbox",
         "dealer_uuid": "b357c9534eaa04d6ec31fa7c6259863af85dbc96ad97ffd19572adfbd528b12e",
