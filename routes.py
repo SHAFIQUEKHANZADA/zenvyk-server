@@ -278,6 +278,31 @@ def _speak_datetime(raw: str) -> str:
     return body
 
 
+def _build_appointment_note(comments: Optional[str], service: str, transport: Optional[str]) -> str:
+    """Assemble the appointment note. Multiple customer concerns are listed line-by-
+    line ("line out the concerns" per Reid) so the advisor/tech sees each one clearly,
+    instead of everything mashed into a single sentence. The agent separates concerns
+    with semicolons or new lines; we split on those and itemise them as bullets."""
+    lines: List[str] = []
+    raw = (comments or "").strip()
+    if raw:
+        parts = [
+            seg.strip(" -•\t")
+            for seg in raw.replace(";", "\n").split("\n")
+            if seg.strip(" -•\t")
+        ]
+        if len(parts) > 1:
+            lines.append("Customer concerns:")
+            lines.extend(f"- {p}" for p in parts)
+        elif parts:
+            lines.append(f"Customer concern: {parts[0]}")
+    else:
+        lines.append(f"Service requested: {service}")
+    if transport:
+        lines.append(f"Transport: {transport}")
+    return "\n".join(lines)
+
+
 def _fail(message: str, error: str = "error", **extra):
     """Any failure MUST tell the agent to hand off to a human. Never leave a caller stranded."""
     payload = {
@@ -789,9 +814,7 @@ async def book_appointment(req: BookRequest):
     # Always write the caller's transport choice into the notes. The structured
     # transportOption field needs UUIDs we can't name yet (scope pending), so
     # without this the advisor has no idea the customer said they'd be waiting.
-    note = req.comments or f"Service requested: {req.service}"
-    if req.transport:
-        note = f"{note} | Transport: {req.transport}"
+    note = _build_appointment_note(req.comments, req.service, req.transport)
 
     booked_time = None
     result = None
