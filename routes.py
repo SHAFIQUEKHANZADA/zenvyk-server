@@ -88,6 +88,12 @@ def parse_day(raw: str) -> Optional[str]:
     today = datetime.now(DEALER_TZ).replace(tzinfo=None).date()
     low = raw.lower().strip()
 
+    # "day after tomorrow" CONTAINS the substring "tomorrow", so it must be
+    # matched FIRST — otherwise it falls through to the tomorrow branch and books
+    # one day too early (Reid call, Shafi's 2017 Civic: asked day-after-tomorrow,
+    # got booked tomorrow).
+    if "day after tomorrow" in low or "day after next" in low or "overmorrow" in low:
+        return (today + timedelta(days=2)).isoformat()
     if "today" in low:
         return today.isoformat()
     if "tomorrow" in low:
