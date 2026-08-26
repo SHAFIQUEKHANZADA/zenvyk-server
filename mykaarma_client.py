@@ -420,15 +420,29 @@ def match_service(catalog: Dict[str, dict], service: str) -> Optional[dict]:
             if any(kw in text for kw in keywords):
                 return op
 
-    # 4. substring / word overlap fallback
+    # 4. substring / word overlap fallback. Ignore generic filler words so a request
+    # like "B1 service" can't match the FIRST opcode that merely contains the word
+    # "service" — that is exactly how "B1" wrongly booked a "Brake Fluid Exchange
+    # Service" at Acura Libertyville (customer asked for B1, got brake fluid). Only
+    # specific, non-filler words may drive a fallback match; if nothing specific is
+    # left, return None and let the caller book WITHOUT a service line rather than
+    # attaching the WRONG service — a blank service line is safe, a wrong one is not.
+    STOPWORDS = {
+        "service", "services", "the", "a", "an", "and", "for", "my", "please",
+        "appointment", "appt", "on", "it", "to", "of", "is", "i", "would", "like",
+        "car", "vehicle", "get", "schedule", "scheduled", "need", "want", "today",
+        "tomorrow", "some", "any", "due", "in", "with", "im", "have",
+    }
     for op in ops:
         name = (op.get("name") or "").lower()
-        if name and (s in name or name in s):
+        if name and len(name) >= 4 and (s in name or name in s):
             return op
-    words = set(s.split())
-    for op in ops:
-        if words & set((op.get("searchtext") or "").split()):
-            return op
+    words = set(s.split()) - STOPWORDS
+    if words:
+        for op in ops:
+            optext = set((op.get("searchtext") or "").split()) - STOPWORDS
+            if words & optext:
+                return op
     return None
 
 
