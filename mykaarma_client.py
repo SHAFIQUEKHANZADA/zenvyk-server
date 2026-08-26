@@ -308,37 +308,49 @@ async def get_opcodes(dealer: Dict[str, str], force: bool = False) -> Dict[str, 
         return _opcode_cache[key]
 
     url = MYKAARMA_BASE_URL + OPCODES_PATH.format(dealer_uuid=dealer["dealer_uuid"])
-    data = await _post(
-        url,
-        dealer,
-        {"resultSize": 50, "startPosition": 0, "getTotalCount": True},
-        step="get_opcodes",
-    )
 
+    # myKaarma PAGINATES opcodes. The old code fetched only the first 50, so any
+    # store with more than 50 services had many opcodes — including Maintenance
+    # Minder codes like B1 / A16 — MISSING from the catalog entirely. The matcher
+    # then couldn't find them and fell back to a wrong/blank opcode (Acura
+    # Libertyville: "B1" had no opcode to match because it was never fetched). Page
+    # through ALL opcodes so every real service is available to match.
     catalog: Dict[str, dict] = {}
-    for op in data.get("operationDTOList") or []:
-        # index by every name we might match on
-        names = {
-            (op.get("description") or "").strip().lower(),
-            (op.get("opCodeName") or "").strip().lower(),
-            (op.get("laborOpCode") or "").strip().lower(),
-        }
-        # full searchable text for keyword matching (real opcodes have verbose DMS
-        # descriptions like "MCGRATH ADVANTAGE OIL AND FILTER CHANGE AND TIRE ROTATION")
-        searchtext = " ".join(
-            str(x) for x in (op.get("description"), op.get("opCodeName"), op.get("laborOpCode"))
-            if x
-        ).lower()
-        entry = {
-            "uuid": op.get("uuid"),
-            "laborOpCode": op.get("laborOpCode"),
-            "minutes": op.get("opCodeDurationInMinutes"),
-            "name": op.get("description") or op.get("opCodeName"),
-            "searchtext": searchtext,
-        }
-        for n in names:
-            if n:
-                catalog[n] = entry
+    start, page_size = 0, 200
+    for _ in range(50):  # hard cap: 50 * 200 = 10k opcodes, far beyond any real store
+        data = await _post(
+            url,
+            dealer,
+            {"resultSize": page_size, "startPosition": start, "getTotalCount": True},
+            step="get_opcodes",
+        )
+        ops_list = data.get("operationDTOList") or []
+        for op in ops_list:
+            # index by every name we might match on
+            names = {
+                (op.get("description") or "").strip().lower(),
+                (op.get("opCodeName") or "").strip().lower(),
+                (op.get("laborOpCode") or "").strip().lower(),
+            }
+            # full searchable text for keyword matching (real opcodes have verbose DMS
+            # descriptions like "MCGRATH ADVANTAGE OIL AND FILTER CHANGE AND TIRE ROTATION")
+            searchtext = " ".join(
+                str(x) for x in (op.get("description"), op.get("opCodeName"), op.get("laborOpCode"))
+                if x
+            ).lower()
+            entry = {
+                "uuid": op.get("uuid"),
+                "laborOpCode": op.get("laborOpCode"),
+                "minutes": op.get("opCodeDurationInMinutes"),
+                "name": op.get("description") or op.get("opCodeName"),
+                "searchtext": searchtext,
+            }
+            for n in names:
+                if n:
+                    catalog[n] = entry
+        if len(ops_list) < page_size:
+            break  # last page
+        start += page_size
 
     _opcode_cache[key] = catalog
     log.info("cached %d opcode names for %s", len(catalog), key)

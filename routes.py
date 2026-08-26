@@ -955,4 +955,16 @@ async def sync_reviews(dealer_key: Optional[str] = None, webhook_url: Optional[s
 async def refresh_opcodes(dealer_key: Optional[str] = None):
     dealer = get_dealer(dealer_key)
     catalog = await mk.get_opcodes(dealer, force=True)
-    return {"cached": len(catalog), "services": sorted(catalog.keys())[:50]}
+    # De-dupe (catalog is keyed by multiple names -> same entry) and list every
+    # unique opcode with its code + description, so we can see the FULL service menu
+    # (e.g. confirm B1/A16 are actually present) and build any needed mappings.
+    uniq = {op["uuid"]: op for op in catalog.values()}.values()
+    opcodes = sorted(
+        ({"code": op.get("laborOpCode"), "name": op.get("name")} for op in uniq),
+        key=lambda x: (x.get("code") or ""),
+    )
+    return {
+        "cached_names": len(catalog),
+        "unique_opcodes": len(opcodes),
+        "opcodes": opcodes,
+    }
