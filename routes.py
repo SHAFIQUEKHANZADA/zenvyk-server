@@ -132,7 +132,7 @@ DEALER_HOURS = {
     3: (0, 24),   # Thursday  24 hours
     4: (0, 24),   # Friday    24 hours
     5: (0, 16),   # Saturday  midnight – 4:00 PM
-    6: (8, 16),   # Sunday    8:00 AM – 4:00 PM
+    6: None,      # Sunday    CLOSED — the service department does not open
 }
 
 # We never OFFER a 3 AM appointment even on a 24-hour day — myKaarma's own
@@ -146,10 +146,27 @@ SPEAKABLE_END = 17
 SLOT_LEAD_MINUTES = 30
 
 
+def is_closed(dt: datetime) -> bool:
+    return DEALER_HOURS.get(dt.weekday(), (8, 17)) is None
+
+
 def day_hours(dt: datetime) -> tuple:
-    """Bookable (open_hour, close_hour) for that weekday, clamped to sane times."""
-    open_h, close_h = DEALER_HOURS.get(dt.weekday(), (8, 17))
+    """Bookable (open_hour, close_hour) for that weekday, clamped to sane times.
+    A closed day returns a zero-width window, so _clamp_business rolls past it."""
+    hours = DEALER_HOURS.get(dt.weekday(), (8, 17))
+    if hours is None:
+        return SPEAKABLE_START, SPEAKABLE_START
+    open_h, close_h = hours
     return max(open_h, SPEAKABLE_START), min(close_h, SPEAKABLE_END)
+
+
+def next_open_day(dt: datetime) -> datetime:
+    """Roll a date forward to the next day the shop is actually open."""
+    for _ in range(8):
+        if not is_closed(dt):
+            return dt
+        dt = dt + timedelta(days=1)
+    return dt
 
 
 def _clamp_business(dt: datetime) -> datetime:
@@ -510,6 +527,13 @@ async def get_slots(req: SlotsRequest):
             datetime.now(DEALER_TZ).replace(tzinfo=None) + timedelta(days=1)
         ).strftime("%Y-%m-%d")]
 
+    # If the caller asked for a day we're closed (Sunday), quote the next open day
+    # instead of returning an empty schedule.
+    dates = [
+        next_open_day(datetime.strptime(d, "%Y-%m-%d")).strftime("%Y-%m-%d")
+        for d in dates
+    ]
+
     # Match the service to an opcode if we can. If we can't (the sandbox only
     # has DUMMYOPCODE), still return real availability rather than dead-ending
     # the call — book_appointment already books without a service line.
@@ -661,6 +685,60 @@ async def get_slots(req: SlotsRequest):
 # ─────────────────────────────────────────────────────────────
 # 3. BOOK APPOINTMENT  — agent calls this after the customer picks a time
 # ─────────────────────────────────────────────────────────────
+async def _slot_taken(
+    req: "BookRequest",
+    wanted: str,
+    customer_uuid: Optional[str],
+    vehicle_uuid: Optional[str],
+) -> dict:
+    """The caller's chosen time was refused at booking. Hand back what's actually open
+    and let THEM pick — booking a different time on their behalf is how callers ended up
+    on another day. Nothing is booked when this returns."""
+    spoken_wanted = _speak_datetime(wanted)
+    slots: List[str] = []
+    spoken: List[str] = []
+    try:
+        alt = await get_slots(SlotsRequest(
+            service=req.service,
+            dates=[wanted[:10]],
+            customer_uuid=customer_uuid,
+            vehicle_uuid=vehicle_uuid,
+            transport=req.transport,
+            dealer_key=req.dealer_key,
+        ))
+        for raw, say in zip(alt.get("slots") or [], alt.get("spoken_slots") or []):
+            if raw != wanted:
+                slots.append(raw)
+                spoken.append(say)
+    except Exception as e:  # never let the fallback lookup break the response
+        log.warning("alternatives lookup failed after slot rejection: %s", e)
+
+    if spoken:
+        instruction = (
+            f"NOTHING IS BOOKED. The {spoken_wanted} slot was taken before we could book "
+            f"it. Do NOT book any other time on your own. Tell the caller: \"I'm sorry — "
+            f"that time was just taken. I do have {' or '.join(spoken)}. Which would you "
+            f"prefer?\" Then call book_appointment again with the exact time they choose."
+        )
+    else:
+        instruction = (
+            f"NOTHING IS BOOKED. The {spoken_wanted} slot was taken and nothing else is "
+            f"open that day. Do NOT book another time on your own. Tell the caller that "
+            f"time just went and ask what other day works, then call get_slots for it."
+        )
+
+    return {
+        "success": False,
+        "booked": False,
+        "slot_taken": True,
+        "requested_time": wanted,
+        "spoken_requested": spoken_wanted,
+        "slots": slots,
+        "spoken_slots": spoken,
+        "agent_instruction": instruction,
+    }
+
+
 @router.post("/book-appointment")
 async def book_appointment(req: BookRequest):
     try:
@@ -835,14 +913,24 @@ async def book_appointment(req: BookRequest):
     last_err = None
     is_reschedule = bool(reschedule_uuid)
     transport_uuid = await mk.resolve_transport(dealer, req.transport)
-    for cand in candidate_times(start, count=16):
+
+    # Book the time the customer actually CHOSE — never quietly substitute another one.
+    # myKaarma's availability API sometimes offers a slot its booking API then rejects
+    # (confirmed: get-slots returns 09:30, create/update answers SLOT_UNAVAILABLE). We
+    # used to auto-advance an hour at a time from there, which silently moved callers to
+    # a different time — and, when a Saturday only had a few slots, to a different DAY.
+    # Now a rejected slot comes back as `slot_taken` with the real remaining options so
+    # the agent can ask the caller instead of deciding for them.
+    wanted = next(candidate_times(start, count=1))
+
+    for _attempt in range(2):  # a 2nd pass only ever runs to drop a bad vehicle_uuid
         try:
             if is_reschedule:
                 # Move the ONE existing appointment in place — no duplicate.
                 result = await mk.update_appointment(
                     dealer,
                     reschedule_uuid,
-                    start=cand,
+                    start=wanted,
                     vehicle_uuid=vehicle_uuid,
                     vin=req.vin,
                     service_op=op,
@@ -855,27 +943,28 @@ async def book_appointment(req: BookRequest):
                     customer_uuid=customer_uuid,
                     vehicle_uuid=vehicle_uuid,
                     vin=req.vin,
-                    start=cand,
+                    start=wanted,
                     service_op=op,
                     phone=req.phone,
                     email=req.email,
                     comments=note,
                     transport_option=transport_uuid,
                 )
-            booked_time = cand
+            booked_time = wanted
             break
         except mk.MyKaarmaError as e:
             last_err = e
             body = e.body or ""
-            if "SLOT_UNAVAILABLE" in body or "NO_TIME_INTERVAL" in body:
-                continue  # that slot is full — try the next one
             if "VEHICLE_UUID_NOT_FOUND" in body and vehicle_uuid:
                 # The vehicle didn't belong to this customer — book WITHOUT it rather
                 # than failing the whole appointment. Better a booking with no vehicle
-                # attached than no booking at all.
+                # attached than no booking at all. Same time, one more try.
                 log.warning("vehicle %s rejected; retrying without it", vehicle_uuid)
                 vehicle_uuid = None
                 continue
+            if "SLOT_UNAVAILABLE" in body or "NO_TIME_INTERVAL" in body:
+                log.info("slot %s rejected by myKaarma — offering alternatives", wanted)
+                return await _slot_taken(req, wanted, customer_uuid, vehicle_uuid)
             log.error("booking failed (non-slot error): %s", e)
             return _fail(
                 "The appointment could not be booked.",
@@ -885,15 +974,15 @@ async def book_appointment(req: BookRequest):
                     "status": e.status,
                     "body": (e.body or "")[:400],
                     "reschedule_uuid": reschedule_uuid,
-                    "cand": cand,
+                    "cand": wanted,
                 },
             )
 
     if not booked_time:
-        log.error("no open slot found near %s: %s", start, last_err)
+        log.error("could not book %s: %s", wanted, last_err)
         return _fail(
-            "I couldn't find an open time near then. Let me have an advisor call you back.",
-            "no_open_slot",
+            "I couldn't get that time booked. Let me have an advisor call you back.",
+            "booking_failed",
             debug={
                 "step": "reschedule" if is_reschedule else "create",
                 "start": start,
