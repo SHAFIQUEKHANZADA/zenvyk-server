@@ -1,9 +1,10 @@
 """
-The 3 endpoints the GHL Voice AI agent calls as Custom Actions.
+The endpoints the GHL Voice AI agent calls as Custom Actions.
 
   POST /mykaarma/lookup-customer    -> who is calling, what do they drive
   POST /mykaarma/get-slots          -> REAL open appointment times
-  POST /mykaarma/book-appointment   -> create the appointment in myKaarma
+  POST /mykaarma/book-appointment   -> create (or reschedule) the appointment
+  POST /mykaarma/cancel-appointment -> cancel the caller's open appointment
 
 Design rule: the voice agent must never have to think. Each endpoint takes
 simple inputs and returns simple, speakable outputs. All the UUID juggling,
@@ -229,6 +230,19 @@ class BookRequest(BaseModel):
     # (from lookup-customer's existing_appointment.appointment_uuid). We then UPDATE
     # that appointment in place instead of creating a new one — no duplicate.
     reschedule_appointment_uuid: Optional[str] = None
+    dealer_key: Optional[str] = None
+
+
+class CancelRequest(BaseModel):
+    # Everything is optional: the agent may know the UUID from lookup-customer, or
+    # it may only have the caller's phone. We resolve the appointment server-side
+    # either way (same safety pattern as book_appointment's reschedule lookup) so a
+    # forgotten/garbled UUID never cancels the wrong thing — or nothing at all.
+    appointment_uuid: Optional[str] = Field(
+        None, description="From lookup-customer's existing_appointment_uuid"
+    )
+    phone: Optional[str] = None
+    customer_uuid: Optional[str] = None
     dealer_key: Optional[str] = None
 
 
@@ -916,6 +930,91 @@ async def book_appointment(req: BookRequest):
 
 
 # ─────────────────────────────────────────────────────────────
+# CANCEL AN APPOINTMENT
+# The agent normally already knows the UUID (lookup-customer returns it as
+# existing_appointment_uuid). But we still resolve server-side from the phone when
+# it's missing or garbled, so "cancel my appointment" works even if the voice model
+# never passed the UUID through. Finding nothing is a NORMAL answer, not an error.
+# ─────────────────────────────────────────────────────────────
+@router.post("/cancel-appointment")
+async def cancel_appointment(req: CancelRequest):
+    try:
+        dealer = get_dealer(req.dealer_key)
+    except DealerNotConfigured as e:
+        return _fail(str(e), "not_configured")
+
+    # 1) Which appointment? Trust an explicit UUID only if it really looks like one —
+    #    the voice model sometimes drops a spoken day ("tomorrow") into this field.
+    appt_uuid = req.appointment_uuid if _looks_like_uuid(req.appointment_uuid) else None
+    appt = None
+
+    if not appt_uuid:
+        customer_uuid = req.customer_uuid
+        if not customer_uuid and req.phone:
+            try:
+                matches = await mk.search_customer(dealer, phone=req.phone)
+            except mk.MyKaarmaError as e:
+                log.error("cancel lookup failed: %s", e)
+                return _fail("I couldn't pull up your appointment.", "lookup_failed")
+            if matches:
+                customer_uuid = mk.parse_search_match(matches[0])["customer_uuid"]
+
+        if customer_uuid:
+            try:
+                appts = await mk.get_customer_appointments(dealer, customer_uuid)
+                now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+                upcoming = mk.upcoming_appointments(appts, now_local)
+                if upcoming:
+                    appt = upcoming[0]
+                    appt_uuid = appt["appointment_uuid"]
+            except mk.MyKaarmaError as e:
+                log.warning("cancel appointment read failed: %s", e)
+
+    # 2) Nothing on the books. Normal outcome — tell the agent to say so plainly.
+    if not appt_uuid:
+        return {
+            "success": False,
+            "cancelled": False,
+            "no_appointment": True,
+            "agent_instruction": (
+                "There is NO open appointment on file for this caller. Say: \"I'm not "
+                "seeing any open appointment on file for this number.\" Then ask if "
+                "they'd like to book one. Do NOT say anything was cancelled."
+            ),
+        }
+
+    # 3) Cancel it.
+    try:
+        await mk.cancel_appointment(dealer, appt_uuid)
+    except mk.MyKaarmaError as e:
+        log.error("cancel failed for %s: %s", appt_uuid, e)
+        return _fail(
+            "I couldn't cancel that appointment.",
+            "cancel_failed",
+            debug={
+                "status": e.status,
+                "body": (e.body or "")[:400],
+                "appointment_uuid": appt_uuid,
+            },
+        )
+
+    when = _speak_datetime(appt.get("start_time")) if appt else None
+    when_txt = f" on {when}" if when else ""
+    log.info("CANCELLED %s", appt_uuid)
+
+    return {
+        "success": True,
+        "cancelled": True,
+        "appointment_uuid": appt_uuid,
+        "spoken_time": when,
+        "agent_instruction": (
+            f"The appointment{when_txt} is cancelled. Tell the caller: \"That's "
+            "cancelled for you.\" Then ask if they'd like to reschedule for another day."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # PER-STORE ROUTES (Method B) — the store is baked into the URL path, so each
 # GHL agent just points to its own endpoint and never has to send a dealer_key
 # in the body. These simply set dealer_key from the path and delegate to the
@@ -941,6 +1040,12 @@ async def get_slots_by_path(dealer_key: str, req: SlotsRequest):
 async def book_appointment_by_path(dealer_key: str, req: BookRequest):
     req.dealer_key = dealer_key
     return await book_appointment(req)
+
+
+@router.post("/{dealer_key}/cancel-appointment")
+async def cancel_appointment_by_path(dealer_key: str, req: CancelRequest):
+    req.dealer_key = dealer_key
+    return await cancel_appointment(req)
 
 
 # ─────────────────────────────────────────────────────────────
