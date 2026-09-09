@@ -266,12 +266,19 @@ def parse_search_match(match: dict) -> dict:
         if not make and not model:
             continue
 
+        label = " ".join(str(x) for x in (v.get("year"), make, model) if x).strip()
+
+        # The same car is often on a record more than once (a duplicate created by
+        # a service visit, an import, or a test). Offering "a 2022 Tesla Model Y or
+        # a 2022 Tesla Model Y" makes the agent sound broken, so keep the first of
+        # each identical year/make/model only.
+        if any(existing["label"].lower() == label.lower() for existing in vehicles):
+            continue
+
         vehicles.append(
             {
                 "vehicle_uuid": v.get("uuid") or v.get("vehicleUuid"),
-                "label": " ".join(
-                    str(x) for x in (v.get("year"), make, model) if x
-                ).strip(),
+                "label": label,
                 "vin": v.get("vin"),
             }
         )
