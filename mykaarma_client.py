@@ -233,27 +233,49 @@ async def search_customer(
 VEHICLE_JUNK = ("no vehicle selected", "other", "unknown", "n/a", "none")
 
 
+# How many vehicles we keep on the record. The agent SPEAKS only the first one
+# (see lookup_customer); the rest are the fallback for "no, not that one".
+MAX_VEHICLES = 3
+
+
+def _vehicle_year(v: dict) -> int:
+    """Model year as an int, for sorting newest first. Unreadable years sort last."""
+    try:
+        return int(str(v.get("year") or "").strip()[:4])
+    except ValueError:
+        return -1
+
+
 def parse_search_match(match: dict) -> dict:
     """Flatten one listMinimal result into the shape the voice agent speaks."""
     vehicles: List[dict] = []
-    for v in match.get("vehicles") or []:
+
+    # NEWEST FIRST. myKaarma returns vehicles in no particular order, so a
+    # customer with a 2018 and a 2006 Pilot was as likely to be offered the 2006.
+    for v in sorted(match.get("vehicles") or [], key=_vehicle_year, reverse=True):
         make = (v.get("make") or "").strip()
         model = (v.get("model") or "").strip()
         if any(j in f"{make} {model}".lower() for j in VEHICLE_JUNK):
             continue  # placeholder, not a real vehicle
-        label = " ".join(
-            str(x) for x in (v.get("year"), make, model) if x
-        ).strip()
-        if not label and not v.get("vin"):
+
+        # A record with no make AND no model cannot be described out loud. These
+        # are real in the live data: one St. Charles customer has a vehicle whose
+        # only content is the VIN field "1410411", and Esther read that number to
+        # him on the phone. Previously the `label or vin` fallback below spoke it.
+        # Skip it and ask for the year/make/model instead.
+        if not make and not model:
             continue
+
         vehicles.append(
             {
                 "vehicle_uuid": v.get("uuid") or v.get("vehicleUuid"),
-                "label": label or v.get("vin"),
+                "label": " ".join(
+                    str(x) for x in (v.get("year"), make, model) if x
+                ).strip(),
                 "vin": v.get("vin"),
             }
         )
-    vehicles = vehicles[:2]  # a phone call can't handle a list of five cars
+    vehicles = vehicles[:MAX_VEHICLES]
     return {
         "customer_uuid": match.get("uuid"),
         "first_name": (match.get("fname") or "").strip() or None,

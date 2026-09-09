@@ -421,11 +421,23 @@ async def lookup_customer(req: LookupRequest):
             f"additional/different one."
         )
     elif found and c["vehicles"]:
-        labels = " or ".join(v["label"] for v in c["vehicles"])
+        # ONE vehicle, the newest. Reading the whole list out loud is what made
+        # callers ask for a human ("I see a 2018 Honda Pilot or a 2006 Honda
+        # Pilot on file. Which one?"). parse_search_match already sorted these
+        # newest first, so [0] is the one to offer.
+        newest = c["vehicles"][0]["label"]
+        others = [v["label"] for v in c["vehicles"][1:]]
         instruction = (
-            f"Greet {c['first_name']} by name and confirm the vehicle: "
-            f"'I see a {labels} on file — is that the vehicle you're bringing in?'"
+            f"Greet {c['first_name']} by name and confirm ONE vehicle only — the "
+            f"newest: 'I see a {newest} on file — is that the vehicle you're "
+            f"bringing in?' Do NOT read out a list of vehicles."
         )
+        if others:
+            instruction += (
+                " Only if they say it is not that one, offer the rest one at a "
+                f"time, newest first: {', '.join(others)}. If none of them match, "
+                "ask for the year, make and model."
+            )
     elif found:
         instruction = (
             f"Greet {c['first_name']} by name, then ask for the year, make and model "
