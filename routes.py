@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter
@@ -144,6 +144,60 @@ SPEAKABLE_END = 17
 # local). Without this, a same-day call in the evening is still offered that
 # morning's times — myKaarma returns the whole day's grid regardless of the clock.
 SLOT_LEAD_MINUTES = 30
+
+# ── ADVISOR CUTOFF (LEARNED) ────────────────────────────────────────────────
+# myKaarma's availability API tells us which slots are FULL. It never tells us
+# which hours a service advisor is actually on the drive, and it reports store
+# hours as 00:00:00–23:44:59, so we cannot read the real cutoff from anywhere.
+# The result: we offered a caller 4:00 PM on a Monday at St. Charles, she said
+# yes, and create_appointment came back NO_SA_AVAILABLE — "No Service Advisor
+# Available for the day". She was transferred, never booked, and went home
+# thinking she had an appointment.
+#
+# Since there is no field to read, we LEARN it. The first time a store refuses
+# a time on a given weekday, we stop offering that time and anything later on
+# that weekday. Each store teaches us its own hours, once, from a real refusal.
+#
+# Deliberately in memory: a redeploy simply relearns it, and the booking-failure
+# recovery below still catches any cutoff we haven't met yet. Nothing breaks if
+# this map is empty — it only ever REMOVES times we already know are unbookable.
+_NO_ADVISOR_FROM: Dict[Tuple[str, int], str] = {}
+
+
+def _advisor_cutoff(dealer_key: Optional[str], day: str) -> Optional[str]:
+    """Earliest 'HH:MM:SS' known to be refused for this store on this weekday."""
+    try:
+        weekday = datetime.strptime(day, "%Y-%m-%d").weekday()
+    except (ValueError, TypeError):
+        return None
+    return _NO_ADVISOR_FROM.get((dealer_key or "", weekday))
+
+
+def _remember_no_advisor(dealer_key: Optional[str], iso: str) -> None:
+    """Record a refusal so we never offer that time (or later) on this weekday."""
+    try:
+        when = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return
+    key = (dealer_key or "", when.weekday())
+    clock = when.strftime("%H:%M:%S")
+    if clock < _NO_ADVISOR_FROM.get(key, "99:99:99"):
+        _NO_ADVISOR_FROM[key] = clock
+        log.warning(
+            "LEARNED: %s has no advisor from %s on %s — no longer offering it",
+            dealer_key, clock, when.strftime("%A"),
+        )
+
+
+def _drop_after_cutoff(slots: List[str], dealer_key: Optional[str]) -> List[str]:
+    """Remove slots at/after a cutoff we've already been refused on that weekday."""
+    kept = []
+    for s in slots:
+        cutoff = _advisor_cutoff(dealer_key, s[:10])
+        if cutoff and s[11:] >= cutoff:
+            continue
+        kept.append(s)
+    return kept
 
 
 def is_closed(dt: datetime) -> bool:
@@ -610,6 +664,7 @@ async def get_slots(req: SlotsRequest):
     now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
     earliest = now_local + timedelta(minutes=SLOT_LEAD_MINUTES)
     slots = [s for s in slots if datetime.fromisoformat(s) > earliest]
+    slots = _drop_after_cutoff(slots, req.dealer_key)
 
     # Honour the caller's time-of-day preference ("12 PM", "after 2", "evening"…).
     # Keep the day's raw openings so we can fall back if the preference matches nothing.
@@ -620,6 +675,17 @@ async def get_slots(req: SlotsRequest):
     # the next day that HAS openings. Callers routinely ask "when's the first
     # available?", and a same-day request late in the day always comes back empty.
     searched_ahead = False
+
+    # The caller's TIME isn't open, but their DAY is. Offer that day's real
+    # openings before considering any other day — the day they asked for is the
+    # stronger preference, and silently moving them to another day is what we
+    # are trying to stop. Only a day with nothing at all falls through to the
+    # look-ahead below.
+    time_pref_missed = False
+    if not slots and day_fallback:
+        slots = day_fallback
+        time_pref_missed = bool(req.time)
+
     if not slots:
         probe = datetime.strptime(dates[0], "%Y-%m-%d")
         for _ in range(14):  # up to two weeks out
@@ -637,15 +703,11 @@ async def get_slots(req: SlotsRequest):
                 )
             except mk.MyKaarmaError:
                 continue
+            found = _drop_after_cutoff(found, req.dealer_key)
             found = _filter_by_time_pref(found, req.time)
             if found:
                 slots, dates, searched_ahead = found, [nxt], True
                 break
-
-    # Time preference matched nothing in the next two weeks — fall back to the
-    # requested day's earliest openings so the caller still gets times to pick from.
-    if not slots and day_fallback:
-        slots, searched_ahead = day_fallback, False
 
     if not slots:
         return {
@@ -671,6 +733,14 @@ async def get_slots(req: SlotsRequest):
             "transfer — keep helping. Once they choose, call book_appointment with the "
             "exact matching value from 'slots'."
         )
+    elif time_pref_missed:
+        instruction = (
+            f"The time the customer asked for is NOT available on {spoken_day}. Say "
+            f"so plainly first — \"I don't have anything then\" — then offer ONLY the "
+            f"times in 'spoken_slots'. Do NOT agree to the time they asked for and do "
+            f"NOT invent another one. Once they choose, call book_appointment with the "
+            f"exact matching value from 'slots'."
+        )
     else:
         instruction = (
             "Offer ONLY these times. Do NOT invent or guess any other time. "
@@ -683,6 +753,7 @@ async def get_slots(req: SlotsRequest):
         "date": dates[0],
         "spoken_date": spoken_day,
         "searched_ahead": searched_ahead,
+        "requested_time_unavailable": time_pref_missed,
         "slots": top,                                   # ISO — send one of these back to /book
         "spoken_slots": [_speak_time(s) for s in top],  # what the agent reads out
         "operation_uuid": op["uuid"] if op else None,
@@ -990,6 +1061,8 @@ async def book_appointment(req: BookRequest):
                 or "NO_SA_AVAILABLE" in body
             ):
                 no_sa = "NO_SA_AVAILABLE" in body
+                if no_sa:
+                    _remember_no_advisor(req.dealer_key, wanted)
                 log.info(
                     "slot %s rejected by myKaarma (%s) — offering alternatives",
                     wanted, "no advisor on shift" if no_sa else "slot taken",
