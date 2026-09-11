@@ -702,10 +702,16 @@ async def _slot_taken(
     wanted: str,
     customer_uuid: Optional[str],
     vehicle_uuid: Optional[str],
+    *,
+    no_advisor: bool = False,
 ) -> dict:
     """The caller's chosen time was refused at booking. Hand back what's actually open
     and let THEM pick — booking a different time on their behalf is how callers ended up
-    on another day. Nothing is booked when this returns."""
+    on another day. Nothing is booked when this returns.
+
+    no_advisor=True means myKaarma answered NO_SA_AVAILABLE: the time isn't a real
+    opening at all (nobody is on the service drive then), rather than a slot someone
+    else grabbed first. Same recovery, but we must not tell the caller it "was taken"."""
     spoken_wanted = _speak_datetime(wanted)
     slots: List[str] = []
     spoken: List[str] = []
@@ -725,18 +731,22 @@ async def _slot_taken(
     except Exception as e:  # never let the fallback lookup break the response
         log.warning("alternatives lookup failed after slot rejection: %s", e)
 
+    gone = "isn't an available time" if no_advisor else "was taken before we could book it"
+    say_gone = (
+        "we don't have an opening then" if no_advisor else "that time was just taken"
+    )
     if spoken:
         instruction = (
-            f"NOTHING IS BOOKED. The {spoken_wanted} slot was taken before we could book "
-            f"it. Do NOT book any other time on your own. Tell the caller: \"I'm sorry — "
-            f"that time was just taken. I do have {' or '.join(spoken)}. Which would you "
-            f"prefer?\" Then call book_appointment again with the exact time they choose."
+            f"NOTHING IS BOOKED. {spoken_wanted} {gone}. Do NOT book any other time on "
+            f"your own. Tell the caller: \"I'm sorry — {say_gone}. I do have "
+            f"{' or '.join(spoken)}. Which would you prefer?\" Then call "
+            f"book_appointment again with the exact time they choose."
         )
     else:
         instruction = (
-            f"NOTHING IS BOOKED. The {spoken_wanted} slot was taken and nothing else is "
-            f"open that day. Do NOT book another time on your own. Tell the caller that "
-            f"time just went and ask what other day works, then call get_slots for it."
+            f"NOTHING IS BOOKED. {spoken_wanted} {gone} and nothing else is open that "
+            f"day. Do NOT book another time on your own. Tell the caller {say_gone} and "
+            f"ask what other day works, then call get_slots for it."
         )
 
     return {
@@ -974,9 +984,19 @@ async def book_appointment(req: BookRequest):
                 log.warning("vehicle %s rejected; retrying without it", vehicle_uuid)
                 vehicle_uuid = None
                 continue
-            if "SLOT_UNAVAILABLE" in body or "NO_TIME_INTERVAL" in body:
-                log.info("slot %s rejected by myKaarma — offering alternatives", wanted)
-                return await _slot_taken(req, wanted, customer_uuid, vehicle_uuid)
+            if (
+                "SLOT_UNAVAILABLE" in body
+                or "NO_TIME_INTERVAL" in body
+                or "NO_SA_AVAILABLE" in body
+            ):
+                no_sa = "NO_SA_AVAILABLE" in body
+                log.info(
+                    "slot %s rejected by myKaarma (%s) — offering alternatives",
+                    wanted, "no advisor on shift" if no_sa else "slot taken",
+                )
+                return await _slot_taken(
+                    req, wanted, customer_uuid, vehicle_uuid, no_advisor=no_sa
+                )
             log.error("booking failed (non-slot error): %s", e)
             return _fail(
                 "The appointment could not be booked.",
@@ -1044,32 +1064,50 @@ async def cancel_appointment(req: CancelRequest):
     except DealerNotConfigured as e:
         return _fail(str(e), "not_configured")
 
-    # 1) Which appointment? Trust an explicit UUID only if it really looks like one —
-    #    the voice model sometimes drops a spoken day ("tomorrow") into this field.
-    appt_uuid = req.appointment_uuid if _looks_like_uuid(req.appointment_uuid) else None
+    # 1) Which appointment? ALWAYS resolve this server-side first.
+    #    We used to trust req.appointment_uuid whenever it "looked like" a UUID.
+    #    But a myKaarma CUSTOMER uuid looks identical to an APPOINTMENT uuid (43
+    #    chars, no spaces), and the voice model does hand us the customer one by
+    #    mistake — it did on 11 Sep, so we PATCHed a customer uuid, myKaarma
+    #    answered INCORRECT_APPOINTMENT, and the caller was transferred instead of
+    #    getting their appointment cancelled. The customer's own upcoming
+    #    appointment is authoritative; the agent's value is only a last resort.
+    #    (Same server-side-first pattern book_appointment uses for reschedules.)
+    appt_uuid = None
     appt = None
 
-    if not appt_uuid:
-        customer_uuid = req.customer_uuid
-        if not customer_uuid and req.phone:
-            try:
-                matches = await mk.search_customer(dealer, phone=req.phone)
-            except mk.MyKaarmaError as e:
-                log.error("cancel lookup failed: %s", e)
-                return _fail("I couldn't pull up your appointment.", "lookup_failed")
-            if matches:
-                customer_uuid = mk.parse_search_match(matches[0])["customer_uuid"]
+    customer_uuid = req.customer_uuid
+    if not customer_uuid and req.phone:
+        try:
+            matches = await mk.search_customer(dealer, phone=req.phone)
+        except mk.MyKaarmaError as e:
+            log.error("cancel lookup failed: %s", e)
+            return _fail("I couldn't pull up your appointment.", "lookup_failed")
+        if matches:
+            customer_uuid = mk.parse_search_match(matches[0])["customer_uuid"]
 
-        if customer_uuid:
-            try:
-                appts = await mk.get_customer_appointments(dealer, customer_uuid)
-                now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
-                upcoming = mk.upcoming_appointments(appts, now_local)
-                if upcoming:
-                    appt = upcoming[0]
-                    appt_uuid = appt["appointment_uuid"]
-            except mk.MyKaarmaError as e:
-                log.warning("cancel appointment read failed: %s", e)
+    if customer_uuid:
+        try:
+            appts = await mk.get_customer_appointments(dealer, customer_uuid)
+            now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+            upcoming = mk.upcoming_appointments(appts, now_local)
+            if upcoming:
+                appt = upcoming[0]
+                appt_uuid = appt["appointment_uuid"]
+        except mk.MyKaarmaError as e:
+            log.warning("cancel appointment read failed: %s", e)
+
+    # Fallback: only now consider what the agent sent — and never if it is the
+    # customer uuid we just resolved, which is the exact mix-up above.
+    if not appt_uuid and _looks_like_uuid(req.appointment_uuid):
+        if req.appointment_uuid == customer_uuid:
+            log.warning(
+                "agent sent the CUSTOMER uuid as appointment_uuid (%s) — ignoring",
+                req.appointment_uuid,
+            )
+        else:
+            appt_uuid = req.appointment_uuid
+            log.info("cancel falling back to agent-supplied uuid %s", appt_uuid)
 
     # 2) Nothing on the books. Normal outcome — tell the agent to say so plainly.
     if not appt_uuid:
