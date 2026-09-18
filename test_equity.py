@@ -280,3 +280,57 @@ def test_known_low_mileage_still_beats_unknown():
     high = screen(phone="3", vehicle_year="2021", vehicle_make="Honda",
                   vehicle_model="Accord", mileage="140k")["priority_score"]
     assert low > unknown > high
+
+
+# ── The GHL push ──────────────────────────────────────────────────────────────
+def test_no_webhook_configured_does_not_break_the_response(monkeypatch):
+    monkeypatch.delenv("EQUITY_WEBHOOK_DEFAULT", raising=False)
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V")
+    assert r["eligible"] is True
+    assert r["ghl"]["pushed"] is False
+
+
+def test_a_failing_push_never_500s_the_workflow_step(monkeypatch):
+    """If the push raises, GHL marks the whole action failed and the contact
+    drops out of the flow silently. It must degrade, not explode."""
+    import equity as eq
+
+    class Boom:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **k): raise RuntimeError("network down")
+
+    monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://example.invalid/hook")
+    monkeypatch.setattr(eq.httpx, "AsyncClient", lambda **k: Boom())
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V")
+    assert r["eligible"] is True
+    assert r["ghl"]["pushed"] is False
+
+
+def test_ineligible_customers_are_never_pushed(monkeypatch):
+    import equity as eq
+    calls = []
+
+    class Spy:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, **k):
+            calls.append(url)
+            class R: status_code = 200; text = ""
+            return R()
+
+    monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://example.invalid/hook")
+    monkeypatch.setattr(eq.httpx, "AsyncClient", lambda **k: Spy())
+    screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+           vehicle_model="CR-V", last_purchase_date=days_ago(60))
+    assert calls == [], "an excluded customer must never reach GHL"
+
+
+def test_per_store_env_var_wins_over_the_default(monkeypatch):
+    from equity import _equity_webhook_url
+    monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://default/hook")
+    monkeypatch.setenv("EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES", "https://store/hook")
+    assert _equity_webhook_url("mcgrath_honda_stcharles") == "https://store/hook"
+    assert _equity_webhook_url("mcgrath_kia_stcharles") == "https://default/hook"

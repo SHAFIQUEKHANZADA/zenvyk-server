@@ -45,16 +45,18 @@ Endpoints:
 """
 
 import logging
+import os
 import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 import mykaarma_client as mk
-from config import get_dealer, DealerNotConfigured
+from config import DEFAULT_DEALER_KEY, get_dealer, DealerNotConfigured
 
 log = logging.getLogger("mykaarma.equity")
 router = APIRouter(prefix="/mykaarma", tags=["Equity Mining"])
@@ -82,6 +84,55 @@ LEASE_HOT_MONTHS = 6
 CLAIM_TIMEOUT_SECONDS = 5 * 60
 
 HOT, WARM, COLD = "hot", "warm", "cold"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUSHING BACK INTO GHL
+#
+# GHL's workflow Condition action cannot read a webhook's RESPONSE — the value
+# picker only offers contact fields, trigger data and account custom values
+# (checked in the St. Charles sub-account, 18 Sep 2026). So a single workflow
+# can't ask us "is this customer eligible?" and branch on the answer.
+#
+# Instead we invert it: the server decides, and only when the answer is yes does
+# it POST to a GHL Inbound Webhook trigger. Everything the text needs rides in
+# that payload, where GHL exposes it under "Workflow trigger" — which the value
+# picker DOES offer.
+#
+# The URL is per store and lives in the environment, not in config.py: it is a
+# credential in all but name, and keeping it out of the repo means adding a
+# store never touches committed code.
+#
+#     EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES=https://services.leadconnectorhq.com/...
+#     EQUITY_WEBHOOK_DEFAULT=...        (fallback for any store without its own)
+# ─────────────────────────────────────────────────────────────────────────────
+def _equity_webhook_url(dealer_key: Optional[str]) -> str:
+    key = (dealer_key or DEFAULT_DEALER_KEY).upper()
+    return (os.getenv(f"EQUITY_WEBHOOK_{key}")
+            or os.getenv("EQUITY_WEBHOOK_DEFAULT")
+            or "").strip()
+
+
+async def _push_to_ghl(dealer_key: Optional[str], payload: dict) -> dict:
+    """
+    Hand the eligible customer to GHL. Never raises: a push that fails must not
+    turn into a 500 on the workflow's webhook step, or GHL marks the whole
+    action failed and the contact silently drops out of the flow.
+    """
+    url = _equity_webhook_url(dealer_key)
+    if not url:
+        log.warning("no EQUITY_WEBHOOK_* set for %s — nothing pushed", dealer_key)
+        return {"pushed": False, "reason": "no_webhook_configured"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as c:
+            r = await c.post(url, json=payload)
+        ok = r.status_code < 400
+        if not ok:
+            log.warning("GHL push failed [%s] %s", r.status_code, r.text[:200])
+        return {"pushed": ok, "status": r.status_code}
+    except Exception as e:                      # noqa: BLE001 - never propagate
+        log.warning("GHL push errored: %s", e)
+        return {"pushed": False, "reason": str(e)[:200]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,6 +539,23 @@ async def equity_screen(req: ScreenRequest):
                        "equity-skip-old-vehicle")
 
     pri = _priority(req)
+    message = _pre_arrival_message(req.first_name, req.vehicle_model,
+                                   req.appointment_day)
+
+    # Hand it straight to GHL — see the PUSHING BACK INTO GHL note above for why
+    # the workflow can't just read this response and branch on it.
+    push = await _push_to_ghl(req.dealer_key, {
+        "phone": req.phone,
+        "first_name": req.first_name,
+        "vehicle": label,
+        "equity_message": message,
+        "equity_priority_band": pri["band"],
+        "equity_priority_score": pri["score"],
+        "equity_priority_reasons": "; ".join(pri["reasons"]),
+        "appointment_day": req.appointment_day,
+        "appointment_time": req.appointment_time,
+    })
+
     return {
         "eligible": True,
         "vehicle": label or None,
@@ -495,10 +563,10 @@ async def equity_screen(req: ScreenRequest):
         "priority_score": pri["score"],
         "priority_band": pri["band"],
         "priority_reasons": pri["reasons"],
-        "message": _pre_arrival_message(req.first_name, req.vehicle_model,
-                                        req.appointment_day),
+        "message": message,
         "tags": ["equity-eligible", f"equity-{pri['band']}"],
         "send_when": "24-48 hours before the service appointment",
+        "ghl": push,
     }
 
 
