@@ -3,8 +3,8 @@ Service drive trade equity mining.
 
 Reid's design, from his own walkthrough:
 
-    customer books service
-        -> 24-48h before the visit, text them about their trade value
+    customer arrives for service
+        -> text them about their trade value WHILE THEY ARE THERE
         -> "yes"  -> tell them what happens next
         -> "want to look at options while you're here?"
         -> "yes"  -> SALESPERSON ALERT fires, they walk over in the waiting room
@@ -27,7 +27,7 @@ That is also the safer wording — several states regulate who may call somethin
 an "appraisal", so the copy here says "estimated trade value" throughout.
 
 When a valuation feed appears, the only thing that changes is that
-`_pre_arrival_message()` gains a figure. Nothing else in this file moves.
+`_onsite_message()` gains a figure. Nothing else in this file moves.
 
 WHAT HOLDS STATE
 ----------------
@@ -38,7 +38,7 @@ restart drops open claims; the cost is two salespeople could approach the same
 customer once, which is the same risk as before any of this existed.
 
 Endpoints:
-    POST /mykaarma/equity-screen     eligible? + the pre-arrival text to send
+    POST /mykaarma/equity-screen     eligible? + the on-site text to send
     POST /mykaarma/equity-response   customer answered -> next step / fire alert
     POST /mykaarma/equity-claim      salesperson claims / presents / closes
     GET  /mykaarma/equity-claims     what's live on the board right now
@@ -56,7 +56,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 import mykaarma_client as mk
-from config import DEFAULT_DEALER_KEY, get_dealer, DealerNotConfigured
+from config import DEALERS, DEFAULT_DEALER_KEY, get_dealer, DealerNotConfigured
 
 log = logging.getLogger("mykaarma.equity")
 router = APIRouter(prefix="/mykaarma", tags=["Equity Mining"])
@@ -106,22 +106,36 @@ HOT, WARM, COLD = "hot", "warm", "cold"
 #     EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES=https://services.leadconnectorhq.com/...
 #     EQUITY_WEBHOOK_DEFAULT=...        (fallback for any store without its own)
 # ─────────────────────────────────────────────────────────────────────────────
-def _equity_webhook_url(dealer_key: Optional[str]) -> str:
+def _equity_webhook_url(dealer_key: Optional[str], kind: str = "") -> str:
+    """
+    Which GHL Inbound Webhook to poke, per store and per purpose.
+
+        kind ""      -> the opening text while they're in service
+        kind "Q2"    -> the follow-up question after they say yes
+        kind "ALERT" -> the salesperson alert
+
+    Three separate GHL workflows rather than one with branches: GHL conditions
+    on trigger data are exactly where this got stuck before, and a workflow with
+    no branch in it cannot be wired up wrong.
+    """
+    part = f"_{kind.upper()}" if kind else ""
     key = (dealer_key or DEFAULT_DEALER_KEY).upper()
-    return (os.getenv(f"EQUITY_WEBHOOK_{key}")
-            or os.getenv("EQUITY_WEBHOOK_DEFAULT")
+    return (os.getenv(f"EQUITY_WEBHOOK{part}_{key}")
+            or os.getenv(f"EQUITY_WEBHOOK{part}_DEFAULT")
             or "").strip()
 
 
-async def _push_to_ghl(dealer_key: Optional[str], payload: dict) -> dict:
+async def _push_to_ghl(dealer_key: Optional[str], payload: dict,
+                       kind: str = "") -> dict:
     """
     Hand the eligible customer to GHL. Never raises: a push that fails must not
     turn into a 500 on the workflow's webhook step, or GHL marks the whole
     action failed and the contact silently drops out of the flow.
     """
-    url = _equity_webhook_url(dealer_key)
+    url = _equity_webhook_url(dealer_key, kind)
     if not url:
-        log.warning("no EQUITY_WEBHOOK_* set for %s — nothing pushed", dealer_key)
+        log.warning("no EQUITY_WEBHOOK%s_* set for %s — nothing pushed",
+                    f"_{kind.upper()}" if kind else "", dealer_key)
         return {"pushed": False, "reason": "no_webhook_configured"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as c:
@@ -443,23 +457,34 @@ def _plural_model(model: Optional[str]) -> str:
     return f"{m}s"
 
 
-def _pre_arrival_message(first_name: Optional[str], model: Optional[str],
-                         day: Optional[str]) -> str:
+def _onsite_message(first_name: Optional[str], model: Optional[str],
+                    store: Optional[str] = None) -> str:
+    """
+    The opening text, sent WHILE the customer is at the dealership.
+
+    This used to go out 24-48h ahead, which quietly broke the whole thing: the
+    customer said yes from their sofa, the salesperson alert fired a day early,
+    and there was nobody in the lounge to walk over to. Reid's own demo opens
+    "While you're in service today" for exactly that reason.
+
+    Says "estimated trade value", never "appraisal" — his demo used the latter,
+    and several states regulate who may call a number an appraisal.
+    """
     name = (first_name or "").strip()
-    hi = f"Hi {name} — " if name else "Hi — "
-    visit = f" visit {day}" if day else " visit"
+    who = f"it's {store}. " if store else ""
+    hi = f"Hi {name}, " if name else "Hi, "
     return _sms_safe(
-        f"{hi}quick one before your service{visit}. Used {_plural_model(model)} "
-        f"are in short supply right now and yours may be worth more than you'd "
-        f"expect. Want us to have an estimated trade value ready when you're in? "
-        f"No obligation either way. Reply STOP to opt out."
+        f"{hi}{who}While you're in for service today - used "
+        f"{_plural_model(model)} are in short supply and yours may be worth more "
+        f"than you'd expect. Want us to put a free estimated trade value on it "
+        f"while you wait? No obligation either way. Reply STOP to opt out."
     )
 
 
 SEE_OPTIONS_MESSAGE = (
-    "Great - we'll have an estimated trade value ready for you at your visit. "
-    "While you're waiting, would you like to see what your options look like? "
-    "No pressure, just a look."
+    "Great - we'll get that number put together for you now. While you're "
+    "waiting, would you like to see what your options look like? No pressure, "
+    "just a look."
 )
 
 CONFIRM_MESSAGE = (
@@ -472,8 +497,8 @@ DECLINE_MESSAGE = (
 )
 
 VALUE_ONLY_MESSAGE = (
-    "Sounds good - we'll have an estimated trade value ready for you at your "
-    "visit. Just ask your service advisor if you'd like to see it."
+    "Sounds good - we'll have that number ready for you. Just ask your service "
+    "advisor before you head out if you'd like to see it."
 )
 
 
@@ -563,8 +588,8 @@ async def equity_screen(req: ScreenRequest):
                        "equity-skip-old-vehicle")
 
     pri = _priority(req)
-    message = _pre_arrival_message(req.first_name, req.vehicle_model,
-                                   req.appointment_day)
+    store = (DEALERS.get(req.dealer_key or DEFAULT_DEALER_KEY) or {}).get("name")
+    message = _onsite_message(req.first_name, req.vehicle_model, store)
 
     # Hand it straight to GHL — see the PUSHING BACK INTO GHL note above for why
     # the workflow can't just read this response and branch on it.
@@ -589,7 +614,7 @@ async def equity_screen(req: ScreenRequest):
         "priority_reasons": pri["reasons"],
         "message": message,
         "tags": ["equity-eligible", f"equity-{pri['band']}"],
-        "send_when": "24-48 hours before the service appointment",
+        "send_when": "when the customer arrives for their service appointment",
         "ghl": push,
     }
 
@@ -622,12 +647,18 @@ async def equity_response(req: ResponseRequest):
     # ── Question 1: do you want to know what it's worth? ─────────────────────
     if req.step == "value_offer":
         if yes is True:
+            push = await _push_to_ghl(req.dealer_key, {
+                "phone": req.phone,
+                "first_name": req.first_name,
+                "equity_message": SEE_OPTIONS_MESSAGE,
+            }, kind="Q2")
             return {
                 "step": req.step, "answer": "yes",
                 "next_message": SEE_OPTIONS_MESSAGE,
                 "next_step": "see_options",
                 "fire_salesperson_alert": False,
                 "tags": ["equity-value-yes"],
+                "ghl": push,
             }
         if yes is False:
             return {
@@ -671,6 +702,17 @@ async def equity_response(req: ResponseRequest):
             ] + [f"- {r}" for r in pri["reasons"]]
             log.info("equity alert %s %s priority=%s", req.first_name, label,
                      pri["score"])
+            card = _sms_safe("\n".join(alert))
+            push = await _push_to_ghl(req.dealer_key, {
+                "phone": req.phone,
+                "first_name": req.first_name,
+                "equity_message": CONFIRM_MESSAGE,
+                "alert_card": card,
+                "vehicle": label,
+                "equity_priority_band": pri["band"],
+                "equity_priority_score": pri["score"],
+                "appointment_time": req.appointment_time,
+            }, kind="ALERT")
             return {
                 "step": req.step, "answer": "yes",
                 "next_message": CONFIRM_MESSAGE,

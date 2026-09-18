@@ -116,7 +116,10 @@ def test_eligible_customer_gets_a_compliant_message():
     assert "appraisal" not in msg.lower()
     # We have no valuation source. No figure may ever appear.
     assert "$" not in msg
-    assert "Dan" in msg and "Tuesday" in msg
+    assert "Dan" in msg
+    # Sent while they are AT the dealership, so it must say so - the
+    # salesperson walk-over only works if the customer is on site.
+    assert "today" in msg.lower()
 
 
 # ── The two-step thread ───────────────────────────────────────────────────────
@@ -340,14 +343,14 @@ def test_outbound_sms_stays_in_the_gsm_alphabet():
     """A single em dash drops SMS from 160-char segments to 70, doubling the
     carrier cost of every send. Nothing customer-facing may leave GSM-7."""
     from equity import (CONFIRM_MESSAGE, DECLINE_MESSAGE, SEE_OPTIONS_MESSAGE,
-                        VALUE_ONLY_MESSAGE, _pre_arrival_message)
+                        VALUE_ONLY_MESSAGE, _onsite_message)
     GSM = set(
         "@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
         "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\n\r"
     ) | set("^{}[~]|€") | {"\\"}
     messages = [
-        _pre_arrival_message("Shafique", "Accord", "Tuesday"),
-        _pre_arrival_message(None, None, None),
+        _onsite_message("Shafique", "Accord", "Tuesday"),
+        _onsite_message(None, None, None),
         SEE_OPTIONS_MESSAGE, CONFIRM_MESSAGE, DECLINE_MESSAGE, VALUE_ONLY_MESSAGE,
         screen(phone="6305550147", first_name="Dan", vehicle_year="2022",
                vehicle_make="Honda", vehicle_model="CR-V")["message"],
