@@ -229,3 +229,34 @@ def test_split_label_pulls_the_model_out():
     assert _split_label("2023 Acura MDX A-Spec") == (2023, "Acura", "MDX A-Spec")
     assert _split_label(None) == (None, None, None)
     assert _split_label("Honda") == (None, None, "Honda")
+
+
+def test_days_since_handles_every_format_ghl_sends():
+    """A date we can't read means the exclusion silently doesn't apply, so all
+    of GHL's shapes have to parse."""
+    from equity import _days_since
+    ninety = datetime.now() - timedelta(days=90)
+    for value in (
+        ninety.strftime("%Y-%m-%d"),
+        ninety.strftime("%Y-%m-%dT%H:%M:%S") + ".000Z",
+        ninety.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00",
+        ninety.strftime("%m/%d/%Y"),
+        str(int(ninety.timestamp() * 1000)),   # epoch millis
+        str(int(ninety.timestamp())),          # epoch seconds
+    ):
+        got = _days_since(value)
+        assert got is not None and 89 <= got <= 91, (value, got)
+
+    # Empty / missing must stay None, not raise.
+    assert _days_since("") is None
+    assert _days_since(None) is None
+    assert _days_since("   ") is None
+    assert _days_since("not a date") is None
+
+
+def test_iso_date_from_ghl_still_blocks_a_recent_purchase():
+    recent = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S") + ".000Z"
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V", last_purchase_date=recent)
+    assert r["eligible"] is False
+    assert "equity-skip-recent-purchase" in r["tags"]

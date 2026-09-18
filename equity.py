@@ -193,14 +193,47 @@ def _split_label(label: Optional[str]):
     return year, make, model
 
 
-def _days_since(iso_date: Optional[str]) -> Optional[int]:
-    if not iso_date:
+def _days_since(raw: Optional[str]) -> Optional[int]:
+    """
+    Days since a date GHL handed us, or None if there isn't one.
+
+    GHL is loose about date custom fields — the same field comes through as
+    '2026-06-20', '2026-06-20T00:00:00.000Z', '06/20/2026', or epoch
+    milliseconds, depending on how it was set. A format we can't read returns
+    None, which means the exclusion SILENTLY DOESN'T APPLY and a customer who
+    bought last month gets the trade text. So anything non-empty that fails to
+    parse is logged loudly rather than shrugged off.
+    """
+    if raw is None:
         return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y"):
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    # Epoch milliseconds (or seconds) — GHL sends these from some field types.
+    if re.fullmatch(r"\d{10}|\d{13}", text):
+        stamp = int(text)
+        seconds = stamp / 1000 if len(text) == 13 else stamp
+        return (datetime.now() - datetime.fromtimestamp(seconds)).days
+
+    # Trim a trailing Z or +00:00 so fromisoformat takes it on any Python.
+    iso = re.sub(r"(Z|[+-]\d{2}:?\d{2})$", "", text)
+    try:
+        parsed = datetime.fromisoformat(iso)
+        return (datetime.now() - parsed.replace(tzinfo=None)).days
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y", "%d/%m/%Y",
+                "%m-%d-%Y", "%B %d, %Y", "%b %d, %Y"):
         try:
-            return (datetime.now() - datetime.strptime(str(iso_date)[:19], fmt)).days
+            return (datetime.now() - datetime.strptime(iso[:19], fmt)).days
         except ValueError:
             continue
+
+    log.warning(
+        "could not read date %r — exclusion NOT applied for this contact", text
+    )
     return None
 
 
