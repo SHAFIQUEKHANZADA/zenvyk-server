@@ -334,3 +334,31 @@ def test_per_store_env_var_wins_over_the_default(monkeypatch):
     monkeypatch.setenv("EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES", "https://store/hook")
     assert _equity_webhook_url("mcgrath_honda_stcharles") == "https://store/hook"
     assert _equity_webhook_url("mcgrath_kia_stcharles") == "https://default/hook"
+
+
+def test_outbound_sms_stays_in_the_gsm_alphabet():
+    """A single em dash drops SMS from 160-char segments to 70, doubling the
+    carrier cost of every send. Nothing customer-facing may leave GSM-7."""
+    from equity import (CONFIRM_MESSAGE, DECLINE_MESSAGE, SEE_OPTIONS_MESSAGE,
+                        VALUE_ONLY_MESSAGE, _pre_arrival_message)
+    GSM = set(
+        "@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\n\r"
+    ) | set("^{}[~]|€") | {"\\"}
+    messages = [
+        _pre_arrival_message("Shafique", "Accord", "Tuesday"),
+        _pre_arrival_message(None, None, None),
+        SEE_OPTIONS_MESSAGE, CONFIRM_MESSAGE, DECLINE_MESSAGE, VALUE_ONLY_MESSAGE,
+        screen(phone="6305550147", first_name="Dan", vehicle_year="2022",
+               vehicle_make="Honda", vehicle_model="CR-V")["message"],
+    ]
+    for m in messages:
+        bad = sorted({c for c in m if c not in GSM})
+        assert not bad, f"non-GSM {bad} in: {m[:70]}"
+
+
+def test_alert_card_to_the_sales_desk_is_also_gsm_safe():
+    r = respond(step="see_options", answer="yes", phone="6305550147",
+                first_name="Dan", vehicle_year="2021", vehicle_make="Honda",
+                vehicle_model="Accord")
+    assert "\u2014" not in r["alert_card"], "em dash in the desk SMS"

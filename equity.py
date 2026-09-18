@@ -405,6 +405,30 @@ def _priority(req) -> dict:
 #   * opt-out on the first message, because this is a MARKETING text, not the
 #     transactional appointment confirmation it rides behind.
 # ─────────────────────────────────────────────────────────────────────────────
+# Characters that are ordinary in prose but force an SMS out of the GSM-7
+# alphabet and into UCS-2 — which cuts the per-segment limit from 160 characters
+# to 70. Measured on the pre-arrival text: one em dash turned a 2-segment
+# message into a 4-segment one, doubling the carrier cost of every send. At
+# seven stores' worth of service appointments that is real money for a dash
+# nobody reads.
+_GSM_SWAPS = {
+    "—": "-", "–": "-",            # em / en dash
+    "’": "'", "‘": "'",            # curly apostrophes
+    "“": '"', "”": '"',            # curly quotes
+    "…": "...", "→": "->",
+    " ": " ",                            # non-breaking space
+}
+
+
+def _sms_safe(text: Optional[str]) -> Optional[str]:
+    """Keep outbound text inside GSM-7 so it bills as 160-character segments."""
+    if not text:
+        return text
+    for bad, good in _GSM_SWAPS.items():
+        text = text.replace(bad, good)
+    return text
+
+
 def _plural_model(model: Optional[str]) -> str:
     """
     'CR-V' -> 'CR-Vs'. The text reads as a person wrote it, so it names the
@@ -424,7 +448,7 @@ def _pre_arrival_message(first_name: Optional[str], model: Optional[str],
     name = (first_name or "").strip()
     hi = f"Hi {name} — " if name else "Hi — "
     visit = f" visit {day}" if day else " visit"
-    return (
+    return _sms_safe(
         f"{hi}quick one before your service{visit}. Used {_plural_model(model)} "
         f"are in short supply right now and yours may be worth more than you'd "
         f"expect. Want us to have an estimated trade value ready when you're in? "
@@ -433,7 +457,7 @@ def _pre_arrival_message(first_name: Optional[str], model: Optional[str],
 
 
 SEE_OPTIONS_MESSAGE = (
-    "Great — we'll have an estimated trade value ready for you at your visit. "
+    "Great - we'll have an estimated trade value ready for you at your visit. "
     "While you're waiting, would you like to see what your options look like? "
     "No pressure, just a look."
 )
@@ -444,11 +468,11 @@ CONFIRM_MESSAGE = (
 )
 
 DECLINE_MESSAGE = (
-    "No problem at all — we'll see you at your service appointment."
+    "No problem at all - we'll see you at your service appointment."
 )
 
 VALUE_ONLY_MESSAGE = (
-    "Sounds good — we'll have an estimated trade value ready for you at your "
+    "Sounds good - we'll have an estimated trade value ready for you at your "
     "visit. Just ask your service advisor if you'd like to see it."
 )
 
@@ -651,7 +675,9 @@ async def equity_response(req: ResponseRequest):
                 "step": req.step, "answer": "yes",
                 "next_message": CONFIRM_MESSAGE,
                 "fire_salesperson_alert": True,
-                "alert_card": "\n".join(alert),
+                # The desk gets this as an SMS too, so it takes the same
+                # GSM-7 treatment as the customer copy.
+                "alert_card": _sms_safe("\n".join(alert)),
                 "priority_score": pri["score"],
                 "priority_band": pri["band"],
                 "claim_timeout_seconds": CLAIM_TIMEOUT_SECONDS,
