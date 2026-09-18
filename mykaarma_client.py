@@ -246,13 +246,23 @@ def _vehicle_year(v: dict) -> int:
         return -1
 
 
+def _vehicle_rank(v: dict) -> tuple:
+    """Sort key: vehicles we can fully describe first, then newest first."""
+    model = str(v.get("model") or "").strip().lower()
+    described = bool(model) and not any(j in model for j in VEHICLE_JUNK)
+    return (described, _vehicle_year(v))
+
+
 def parse_search_match(match: dict) -> dict:
     """Flatten one listMinimal result into the shape the voice agent speaks."""
     vehicles: List[dict] = []
 
-    # NEWEST FIRST. myKaarma returns vehicles in no particular order, so a
-    # customer with a 2018 and a 2006 Pilot was as likely to be offered the 2006.
-    for v in sorted(match.get("vehicles") or [], key=_vehicle_year, reverse=True):
+    # DESCRIBABLE FIRST, THEN NEWEST FIRST. myKaarma returns vehicles in no
+    # particular order, so a customer with a 2018 and a 2006 Pilot was as likely
+    # to be offered the 2006. And records often carry year + make with no model:
+    # an Acura Libertyville caller was offered "a 2023 Honda" because it sorted
+    # ahead of their 2023 Acura Integra of the same year.
+    for v in sorted(match.get("vehicles") or [], key=_vehicle_rank, reverse=True):
         make = (v.get("make") or "").strip()
         model = (v.get("model") or "").strip()
         if any(j in f"{make} {model}".lower() for j in VEHICLE_JUNK):

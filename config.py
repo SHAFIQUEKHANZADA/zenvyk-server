@@ -62,6 +62,10 @@ DEALERS: Dict[str, Dict[str, str]] = {
         "name": "McGrath Acura of Libertyville",
         "dealer_uuid": "83abfacbb3e6236122ff808b4a27852bc6968fdb14242c0b796b196d88974cc5",
         "department_uuid": "af7feeebf612aed0c88bbdaadb9e645b6636841f8d171de726e6b99631dbfdc4",
+        # Where a failed lookup/booking sends the caller. Matches the GHL Call transfer
+        # action; Reid test-called and confirmed transfers to it work, 15 Sep 2026.
+        # Stores without this key fall back to routes.TRANSFER_NUMBER.
+        "transfer_number": "847-859-0491",
     },
     "mcgrath_audi_mortongrove": {
         "name": "Audi Morton Grove",

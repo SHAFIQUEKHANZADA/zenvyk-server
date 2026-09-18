@@ -12,6 +12,7 @@ JSON parsing and opcode mapping happens here, in code.
 """
 
 import asyncio
+from contextvars import ContextVar
 import logging
 import re
 from datetime import datetime, timedelta
@@ -22,12 +23,24 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 import mykaarma_client as mk
-from config import MAX_SLOTS, get_dealer, DealerNotConfigured
+from config import DEALERS, MAX_SLOTS, get_dealer, DealerNotConfigured
 
 log = logging.getLogger("mykaarma.routes")
 router = APIRouter(prefix="/mykaarma", tags=["myKaarma"])
 
 TRANSFER_NUMBER = "630-797-4570"
+
+# The store THIS request is for, so a failure hands the caller to that store's own
+# line. TRANSFER_NUMBER used to be the only number for every store, so an Acura
+# Libertyville caller whose lookup or booking failed was told to transfer to a
+# 630 (St. Charles) line. Set at the top of each handler; per-request safe.
+_REQUEST_DEALER: ContextVar[Optional[str]] = ContextVar("request_dealer", default=None)
+
+
+def _transfer_number() -> str:
+    """This request's store transfer line; the old shared number if none is set."""
+    store = DEALERS.get(_REQUEST_DEALER.get() or "") or {}
+    return store.get("transfer_number") or TRANSFER_NUMBER
 DEALER_TZ = ZoneInfo("America/Chicago")  # St. Charles, IL is Central
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
@@ -390,14 +403,15 @@ def _build_appointment_note(comments: Optional[str], service: str, transport: Op
 
 def _fail(message: str, error: str = "error", **extra):
     """Any failure MUST tell the agent to hand off to a human. Never leave a caller stranded."""
+    number = _transfer_number()
     payload = {
         "success": False,
         "error": error,
         "message": message,
-        "transfer_to": TRANSFER_NUMBER,
+        "transfer_to": number,
         "agent_instruction": (
             "Apologize, tell the customer you'll connect them with a service advisor, "
-            f"and transfer the call to {TRANSFER_NUMBER}."
+            f"and transfer the call to {number}."
         ),
     }
     payload.update(extra)
@@ -409,6 +423,7 @@ def _fail(message: str, error: str = "error", **extra):
 # ─────────────────────────────────────────────────────────────
 @router.post("/lookup-customer")
 async def lookup_customer(req: LookupRequest):
+    _REQUEST_DEALER.set(req.dealer_key)
     try:
         dealer = get_dealer(req.dealer_key)
     except DealerNotConfigured as e:
@@ -577,6 +592,7 @@ def _filter_by_time_pref(slots: List[str], pref: Optional[str]) -> List[str]:
 # ─────────────────────────────────────────────────────────────
 @router.post("/get-slots")
 async def get_slots(req: SlotsRequest):
+    _REQUEST_DEALER.set(req.dealer_key)
     try:
         dealer = get_dealer(req.dealer_key)
     except DealerNotConfigured as e:
@@ -690,7 +706,15 @@ async def get_slots(req: SlotsRequest):
         probe = datetime.strptime(dates[0], "%Y-%m-%d")
         for _ in range(14):  # up to two weeks out
             probe += timedelta(days=1)
+            if is_closed(probe):
+                continue
             nxt = probe.strftime("%Y-%m-%d")
+            # Same bookable window as the requested day. This call used to omit it, so
+            # look-ahead days fell back to get_availability's 08:00-19:00 default and
+            # offered 5:00 and 5:30 PM, past SPEAKABLE_END with no advisor on shift. An
+            # Acura Libertyville caller asking for "today" was told 5 PM tomorrow was
+            # "the earliest"; the booking was refused and they were moved a day later.
+            ahead_open, ahead_close = day_hours(probe)
             try:
                 found = await mk.get_availability(
                     dealer,
@@ -700,6 +724,8 @@ async def get_slots(req: SlotsRequest):
                     operation_uuid=op["uuid"] if op else None,
                     transport_option_uuid=transport_uuid,
                     existing_appointment_uuid=existing_appt_uuid,
+                    start_time=f"{ahead_open:02d}:00:00",
+                    end_time=f"{ahead_close:02d}:00:00",
                 )
             except mk.MyKaarmaError:
                 continue
@@ -834,6 +860,7 @@ async def _slot_taken(
 
 @router.post("/book-appointment")
 async def book_appointment(req: BookRequest):
+    _REQUEST_DEALER.set(req.dealer_key)
     try:
         dealer = get_dealer(req.dealer_key)
     except DealerNotConfigured as e:
@@ -972,16 +999,23 @@ async def book_appointment(req: BookRequest):
                     v for v in mk.parse_search_match(m)["vehicles"]
                     if "no vehicle selected" not in (v.get("label") or "").lower()
                 ]
-                # prefer the vehicle matching what the caller told us; else first real one
+                # prefer the vehicle matching what the caller told us
                 for v in real:
                     label = (v.get("label") or "").lower()
                     if want and all(w in label for w in want.split() if w):
                         vehicle_uuid = v["vehicle_uuid"]
                         break
-                if not vehicle_uuid and real:
+                # Fall back to the first vehicle on file ONLY when the caller never
+                # named one. If they did and it isn't on file, attaching a different
+                # car is worse than none: a caller who said "2024 Acura MDX" was
+                # booked on a 2023 Honda. myKaarma accepts an appointment with no
+                # vehicle, and the stated vehicle goes into the notes below.
+                if not vehicle_uuid and real and not want:
                     vehicle_uuid = real[0]["vehicle_uuid"]
                 break
-            if vehicle_uuid:
+            # Only a customer we just CREATED needs time to index. A known caller's
+            # vehicles are already searchable, so waiting would only add dead air.
+            if vehicle_uuid or req.customer_uuid:
                 break
             await asyncio.sleep(1.3)  # let myKaarma index the new customer/vehicle
 
@@ -1000,6 +1034,12 @@ async def book_appointment(req: BookRequest):
     # transportOption field needs UUIDs we can't name yet (scope pending), so
     # without this the advisor has no idea the customer said they'd be waiting.
     note = _build_appointment_note(req.comments, req.service, req.transport)
+    stated_vehicle = " ".join(
+        str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
+    ).strip()
+    if stated_vehicle and not vehicle_uuid:
+        # The caller named a car we couldn't attach. Put it where the advisor sees it.
+        note = "\n".join(x for x in (note, f"Vehicle (per caller, not on file): {stated_vehicle}") if x)
 
     booked_time = None
     result = None
@@ -1132,6 +1172,7 @@ async def book_appointment(req: BookRequest):
 # ─────────────────────────────────────────────────────────────
 @router.post("/cancel-appointment")
 async def cancel_appointment(req: CancelRequest):
+    _REQUEST_DEALER.set(req.dealer_key)
     try:
         dealer = get_dealer(req.dealer_key)
     except DealerNotConfigured as e:

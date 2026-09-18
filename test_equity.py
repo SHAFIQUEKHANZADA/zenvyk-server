@@ -1,0 +1,221 @@
+"""
+Tests for the service drive trade equity flow.
+
+Run:  .venv/Scripts/python.exe -m pytest test_equity.py -q
+
+These lock down Reid's design decisions, not the arithmetic:
+  * the salesperson alert waits for the SECOND yes
+  * nobody who bought in the last 12 months gets the text
+  * no message ever states a dollar figure
+  * two salespeople cannot claim the same customer
+"""
+
+import asyncio
+from datetime import datetime, timedelta
+
+import equity
+from equity import (
+    COLD,
+    HOT,
+    ClaimRequest,
+    ResponseRequest,
+    ScreenRequest,
+    _is_yes,
+    _parse_mileage,
+    equity_claim,
+    equity_claims,
+    equity_response,
+    equity_screen,
+)
+
+
+def screen(**kw):
+    return asyncio.run(equity_screen(ScreenRequest(**kw)))
+
+
+def respond(**kw):
+    return asyncio.run(equity_response(ResponseRequest(**kw)))
+
+
+def claim(**kw):
+    return asyncio.run(equity_claim(ClaimRequest(**kw)))
+
+
+def days_ago(n):
+    return (datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def setup_function():
+    equity._CLAIMS.clear()
+
+
+# ── Reading replies off a phone ───────────────────────────────────────────────
+def test_is_yes_reads_how_people_actually_text():
+    for s in ("yes", "Yes please", "yeah", "yep", "sure", "ok", "Y", "sounds good"):
+        assert _is_yes(s) is True, s
+    for s in ("no", "No thanks", "nope", "not today", "not interested", "STOP"):
+        assert _is_yes(s) is False, s
+    # Anything we can't read must NOT be guessed at.
+    assert _is_yes("what do you mean") is None
+    assert _is_yes("") is None
+    assert _is_yes(None) is None
+
+
+def test_parse_mileage_handles_spoken_and_typed():
+    assert _parse_mileage("84,000") == 84000
+    assert _parse_mileage("about 84k") == 84000
+    assert _parse_mileage(62000) == 62000
+    assert _parse_mileage("no idea") is None
+
+
+# ── Screening: Reid's exclusions ──────────────────────────────────────────────
+def test_recent_purchase_is_excluded():
+    """Reid: 'we need to make sure this excludes purchases from past 12 months.'"""
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V", last_purchase_date=days_ago(90))
+    assert r["eligible"] is False
+    assert "equity-skip-recent-purchase" in r["tags"]
+    assert r["message"] is None
+
+
+def test_purchase_older_than_a_year_is_fine():
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V", last_purchase_date=days_ago(400))
+    assert r["eligible"] is True
+
+
+def test_recent_decline_is_suppressed():
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V", last_declined_date=days_ago(30))
+    assert r["eligible"] is False
+    assert "equity-skip-cooldown" in r["tags"]
+
+
+def test_campaign_collision_is_suppressed():
+    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+               vehicle_model="CR-V", in_active_campaign=True)
+    assert r["eligible"] is False
+    assert "equity-skip-collision" in r["tags"]
+
+
+def test_very_old_vehicle_is_skipped():
+    r = screen(phone="6305550147", vehicle_year="2005", vehicle_make="Honda",
+               vehicle_model="Civic")
+    assert r["eligible"] is False
+
+
+def test_eligible_customer_gets_a_compliant_message():
+    r = screen(phone="6305550147", first_name="Dan", vehicle_year="2022",
+               vehicle_make="Honda", vehicle_model="CR-V", mileage="34k",
+               appointment_day="Tuesday")
+    assert r["eligible"] is True
+    msg = r["message"]
+    # Marketing text -> must carry an opt-out.
+    assert "STOP" in msg
+    # "Appraisal" is regulated language in several states.
+    assert "appraisal" not in msg.lower()
+    # We have no valuation source. No figure may ever appear.
+    assert "$" not in msg
+    assert "Dan" in msg and "Tuesday" in msg
+
+
+# ── The two-step thread ───────────────────────────────────────────────────────
+def test_first_yes_does_not_fire_the_alert():
+    """Reid was explicit: wanting a number is not wanting to be approached."""
+    r = respond(step="value_offer", answer="yes", phone="6305550147",
+                vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
+    assert r["fire_salesperson_alert"] is False
+    assert r["next_step"] == "see_options"
+
+
+def test_second_yes_fires_the_alert():
+    r = respond(step="see_options", answer="sure", phone="6305550147",
+                first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+                vehicle_model="CR-V", mileage="34k",
+                appointment_time="Tue 9:00 AM")
+    assert r["fire_salesperson_alert"] is True
+    assert "Dan" in r["alert_card"]
+    assert r["claim_timeout_seconds"] == equity.CLAIM_TIMEOUT_SECONDS
+    # Still no figure anywhere in what the customer receives.
+    assert "$" not in r["next_message"]
+
+
+def test_no_to_options_still_gives_them_the_number_in_person():
+    r = respond(step="see_options", answer="no thanks", phone="6305550147")
+    assert r["fire_salesperson_alert"] is False
+    assert "equity-options-no" in r["tags"]
+
+
+def test_stop_is_an_opt_out_not_a_no():
+    r = respond(step="value_offer", answer="STOP", phone="6305550147")
+    assert r["answer"] == "opt_out"
+    assert "equity-opted-out" in r["tags"]
+    assert r["next_message"] is None
+
+
+def test_unclear_reply_is_routed_to_a_human():
+    r = respond(step="value_offer", answer="what do you mean?",
+                phone="6305550147")
+    assert r["answer"] == "unclear"
+    assert r["fire_salesperson_alert"] is False
+    assert r["next_message"] is None
+
+
+# ── The claim board ───────────────────────────────────────────────────────────
+def test_two_salespeople_cannot_claim_the_same_customer():
+    respond(step="see_options", answer="yes", phone="6305550147",
+            first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+            vehicle_model="CR-V")
+
+    first = claim(phone="6305550147", salesperson="Mitch", action="claim")
+    assert first["success"] is True
+
+    second = claim(phone="6305550147", salesperson="Brad", action="claim")
+    assert second["success"] is False
+    assert second["error"] == "already_claimed"
+    assert second["claimed_by"] == "Mitch"
+
+
+def test_release_puts_it_back_on_the_board():
+    respond(step="see_options", answer="yes", phone="6305550147",
+            vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    claim(phone="6305550147", salesperson="Mitch", action="release")
+    assert claim(phone="6305550147", salesperson="Brad",
+                 action="claim")["success"] is True
+
+
+def test_presented_and_sold_are_logged_for_the_funnel():
+    respond(step="see_options", answer="yes", phone="6305550147",
+            vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    assert claim(phone="6305550147", action="presented")["status"] == "presented"
+    assert claim(phone="6305550147", action="sold")["status"] == "sold"
+
+
+def test_claiming_something_that_does_not_exist():
+    assert claim(phone="0000000000", salesperson="Mitch",
+                 action="claim")["success"] is False
+
+
+def test_claim_times_out_to_the_bdc():
+    respond(step="see_options", answer="yes", phone="6305550147",
+            vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    # Wind the clock past the timeout rather than sleeping through it.
+    equity._CLAIMS["6305550147"]["at"] -= equity.CLAIM_TIMEOUT_SECONDS + 1
+    board = asyncio.run(equity_claims())
+    assert board["timed_out"] == 1
+
+
+def test_board_sorts_highest_priority_first():
+    respond(step="see_options", answer="yes", phone="1111111111",
+            first_name="Old", vehicle_year="2016", vehicle_make="Honda",
+            vehicle_model="Civic", mileage="160k")
+    respond(step="see_options", answer="yes", phone="2222222222",
+            first_name="Prime", vehicle_year="2023", vehicle_make="Acura",
+            vehicle_model="MDX", mileage="18k", is_lease=True,
+            lease_months_remaining=3)
+    board = asyncio.run(equity_claims())
+    assert board["claims"][0]["name"] == "Prime"
+    assert board["claims"][0]["priority_band"] == HOT
