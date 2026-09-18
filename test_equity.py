@@ -413,27 +413,48 @@ def test_per_store_env_var_wins_over_the_default(monkeypatch):
 
 
 # ── Working out which question a reply answers ───────────────────────────────
-def test_step_is_inferred_from_the_contact_tags():
-    """GHL sends {{contact.tags}} instead of branching on a Condition -- the
-    Condition action is where this build kept getting stuck."""
-    first = respond(answer="yes", phone="6305550147", tags="equity-texted")
+def test_the_server_remembers_which_question_is_outstanding():
+    """This account's GHL offers no merge field for contact tags, so the reply
+    webhook cannot tell us which question it answers. The server tracks it."""
+    equity._AWAITING.clear()
+    first = respond(answer="yes", phone="6305550147")
     assert first["step"] == "value_offer"
     assert first["fire_salesperson_alert"] is False
 
-    second = respond(answer="yes", phone="6305550147",
-                     tags="equity-texted, equity-value-yes")
+    # The first yes pushed question two, so the NEXT reply answers that one.
+    second = respond(answer="yes", phone="6305550147")
     assert second["step"] == "see_options"
     assert second["fire_salesperson_alert"] is True
 
+    # And it is cleared afterwards, so a later visit starts from the top.
+    third = respond(answer="yes", phone="6305550147")
+    assert third["step"] == "value_offer"
 
-def test_explicit_step_still_wins_over_tags():
+
+def test_tags_win_when_ghl_does_send_them():
+    equity._AWAITING.clear()
+    for tags in ("equity-texted, equity-value-yes",
+                 ["equity-texted", "equity-value-yes"]):
+        r = respond(answer="yes", phone="6305550147", tags=tags)
+        assert r["step"] == "see_options", tags
+        equity._AWAITING.clear()
+
+
+def test_a_stale_conversation_starts_over():
+    equity._AWAITING.clear()
+    respond(answer="yes", phone="6305550147")
+    equity._AWAITING["6305550147"] -= equity.AWAITING_TTL_SECONDS + 1
+    assert respond(answer="yes", phone="6305550147")["step"] == "value_offer"
+
+
+def test_explicit_step_still_wins():
     r = respond(step="value_offer", answer="yes", phone="6305550147",
                 tags="equity-texted, equity-value-yes")
     assert r["step"] == "value_offer"
 
 
 def test_stop_works_whichever_question_they_are_on():
-    for tags in ("equity-texted", "equity-texted, equity-value-yes"):
-        r = respond(answer="STOP", phone="6305550147", tags=tags)
-        assert r["answer"] == "opt_out"
-        assert "equity-opted-out" in r["tags"]
+    equity._AWAITING.clear()
+    assert respond(answer="STOP", phone="6305550147")["answer"] == "opt_out"
+    respond(answer="yes", phone="6305550147")          # now on question two
+    assert respond(answer="STOP", phone="6305550147")["answer"] == "opt_out"

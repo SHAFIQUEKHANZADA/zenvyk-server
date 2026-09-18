@@ -200,7 +200,8 @@ class ResponseRequest(BaseModel):
     # Condition step in the workflow. Conditions are exactly where this build
     # kept getting stuck, so the fewer of them the better.
     step: Optional[str] = Field(None, description="value_offer | see_options")
-    tags: Optional[str] = None      # GHL's {{contact.tags}}, comma separated
+    # GHL may send this as "a, b" or ["a", "b"], or not at all.
+    tags: Optional[object] = None
     answer: Optional[str] = None      # free text: "yes", "sure", "no thanks", "STOP"
 
     is_lease: Optional[bool] = None
@@ -512,6 +513,45 @@ VALUE_ONLY_MESSAGE = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# WHICH QUESTION IS THIS REPLY ANSWERING?
+#
+# GHL's "Customer replied" webhook can send the message body, but this account's
+# value picker offers no merge field for the contact's tags — so the workflow
+# cannot tell us whether the reply in hand answers question one or question two.
+#
+# So we remember it ourselves. When we push the second question out, we note
+# that this phone number now owes us an answer to it. The whole exchange happens
+# while the customer sits in the service lounge, so a short memory is enough, and
+# a Railway restart mid-conversation just drops them back to question one — they
+# get asked if they want a value again, which is harmless.
+#
+# If GHL ever does hand us tags, those win: they are the real state.
+# ─────────────────────────────────────────────────────────────────────────────
+_AWAITING: Dict[str, float] = {}
+AWAITING_TTL_SECONDS = 4 * 60 * 60      # one service visit, generously
+
+
+def _expect_second_answer(phone: Optional[str]) -> None:
+    if phone:
+        _AWAITING[phone] = time.time()
+
+
+def _resolve_step(phone: Optional[str], tags=None) -> str:
+    # Tags, if GHL gave us any, in whatever shape it sent them.
+    if tags:
+        text = ", ".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
+        if "equity-value-yes" in text.lower():
+            return "see_options"
+
+    started = _AWAITING.get(phone or "")
+    if started and time.time() - started < AWAITING_TTL_SECONDS:
+        return "see_options"
+    if started:
+        _AWAITING.pop(phone or "", None)    # stale, start again
+    return "value_offer"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Live claims board.
 #
 # Keyed by phone. Short-lived on purpose: a claim only matters while the
@@ -663,10 +703,7 @@ async def equity_response(req: ResponseRequest):
     # Work out which question this reply answers, if GHL didn't say. The tag
     # equity-value-yes is added when they say yes to the first one, so its
     # presence means the reply in hand is the answer to the second.
-    step = req.step
-    if not step:
-        tags = (req.tags or "").lower()
-        step = "see_options" if "equity-value-yes" in tags else "value_offer"
+    step = req.step or _resolve_step(req.phone, req.tags)
 
     if _opted_out(req.answer):
         log.info("equity opt-out from %s", req.phone)
@@ -680,6 +717,7 @@ async def equity_response(req: ResponseRequest):
     # ── Question 1: do you want to know what it's worth? ─────────────────────
     if step == "value_offer":
         if yes is True:
+            _expect_second_answer(req.phone)
             push = await _push_to_ghl(req.dealer_key, {
                 "phone": req.phone,
                 "first_name": req.first_name,
@@ -711,6 +749,7 @@ async def equity_response(req: ResponseRequest):
 
     # ── Question 2: want to look at options while you're here? ───────────────
     if step == "see_options":
+        _AWAITING.pop(req.phone or "", None)
         if yes is True:
             _clean_claims()
             if req.phone:
