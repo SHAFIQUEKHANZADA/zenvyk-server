@@ -260,3 +260,23 @@ def test_iso_date_from_ghl_still_blocks_a_recent_purchase():
                vehicle_model="CR-V", last_purchase_date=recent)
     assert r["eligible"] is False
     assert "equity-skip-recent-purchase" in r["tags"]
+
+
+def test_unknown_mileage_is_treated_as_average_not_as_zero():
+    """myKaarma doesn't return mileage and GHL has no field for it, so unknown
+    is the NORMAL case. Scoring it as zero made every real customer cold."""
+    r = screen(phone="6305550147", first_name="Shafique", vehicle_year="2021",
+               vehicle_make="Honda", vehicle_model="Accord")
+    assert r["eligible"] is True
+    assert r["priority_band"] != COLD, r["priority_score"]
+    assert any("unknown" in x.lower() for x in r["priority_reasons"])
+
+
+def test_known_low_mileage_still_beats_unknown():
+    low = screen(phone="1", vehicle_year="2021", vehicle_make="Honda",
+                 vehicle_model="Accord", mileage="30k")["priority_score"]
+    unknown = screen(phone="2", vehicle_year="2021", vehicle_make="Honda",
+                     vehicle_model="Accord")["priority_score"]
+    high = screen(phone="3", vehicle_year="2021", vehicle_make="Honda",
+                  vehicle_model="Accord", mileage="140k")["priority_score"]
+    assert low > unknown > high

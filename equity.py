@@ -317,6 +317,15 @@ def _priority(req) -> dict:
     elif miles is not None:
         score += 12
         reasons.append(f"{miles:,} miles")
+    elif age is not None:
+        # We usually DON'T know the mileage: myKaarma doesn't return it on the
+        # customer record and GHL has no field for it. Treating unknown as zero
+        # scored almost every real customer "cold" and made the band useless --
+        # a 5-year-old Accord came back 30/100. Unknown means unknown, so assume
+        # typical mileage for the age rather than the worst case, and say so on
+        # the card so the salesperson knows the number is a guess.
+        score += 16
+        reasons.append("Mileage unknown — assumed average for its age")
 
     if req.is_lease:
         score += 20
