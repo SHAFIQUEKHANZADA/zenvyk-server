@@ -176,6 +176,23 @@ def _parse_mileage(value) -> Optional[int]:
     return int(m.group(0)) if m else None
 
 
+def _split_label(label: Optional[str]):
+    """
+    '2020 Honda Accord Sport' -> (2020, 'Honda', 'Accord Sport').
+    myKaarma hands vehicles back as one string; the SMS copy needs the model on
+    its own. Returns (None, None, None) for anything we can't split.
+    """
+    if not label:
+        return None, None, None
+    parts = str(label).split()
+    year = _year(parts[0]) if parts else None
+    if year is None:
+        return None, None, " ".join(parts) or None
+    make = parts[1] if len(parts) > 1 else None
+    model = " ".join(parts[2:]) if len(parts) > 2 else None
+    return year, make, model
+
+
 def _days_since(iso_date: Optional[str]) -> Optional[int]:
     if not iso_date:
         return None
@@ -384,7 +401,14 @@ async def equity_screen(req: ScreenRequest):
                 c = mk.parse_search_match(matches[0])
                 if c["vehicles"]:
                     label = c["vehicles"][0]["label"]
-                    req.vehicle_year = str(_year(label) or "")
+                    # Split it out, not just the year. The text names the MODEL
+                    # ("Used CR-Vs are in short supply"), so without this every
+                    # myKaarma-sourced customer gets the generic "vehicles like
+                    # yours" wording instead.
+                    y, make, model = _split_label(label)
+                    req.vehicle_year = str(y or "")
+                    req.vehicle_make = req.vehicle_make or make
+                    req.vehicle_model = req.vehicle_model or model
                 if not req.first_name:
                     req.first_name = c.get("first_name")
         except (DealerNotConfigured, mk.MyKaarmaError) as e:

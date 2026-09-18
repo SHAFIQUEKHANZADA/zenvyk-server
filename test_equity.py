@@ -219,3 +219,13 @@ def test_board_sorts_highest_priority_first():
     board = asyncio.run(equity_claims())
     assert board["claims"][0]["name"] == "Prime"
     assert board["claims"][0]["priority_band"] == HOT
+
+
+def test_split_label_pulls_the_model_out():
+    """myKaarma gives one string; the SMS copy needs the model alone."""
+    from equity import _split_label
+    assert _split_label("2020 Honda Accord") == (2020, "Honda", "Accord")
+    assert _split_label("2022 Honda CR-V") == (2022, "Honda", "CR-V")
+    assert _split_label("2023 Acura MDX A-Spec") == (2023, "Acura", "MDX A-Spec")
+    assert _split_label(None) == (None, None, None)
+    assert _split_label("Honda") == (None, None, "Honda")
