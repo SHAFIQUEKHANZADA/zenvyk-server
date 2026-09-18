@@ -195,7 +195,12 @@ class ResponseRequest(BaseModel):
     appointment_day: Optional[str] = None
 
     # Which question they just answered, and what they said.
-    step: str = Field(..., description="value_offer | see_options")
+    # Which question they just answered. GHL doesn't have to work this out --
+    # it can send the contact's tags instead and we infer it, which saves a
+    # Condition step in the workflow. Conditions are exactly where this build
+    # kept getting stuck, so the fewer of them the better.
+    step: Optional[str] = Field(None, description="value_offer | see_options")
+    tags: Optional[str] = None      # GHL's {{contact.tags}}, comma separated
     answer: Optional[str] = None      # free text: "yes", "sure", "no thanks", "STOP"
 
     is_lease: Optional[bool] = None
@@ -655,17 +660,25 @@ async def equity_response(req: ResponseRequest):
     yes = _is_yes(req.answer)
     pri = _priority(req)
 
+    # Work out which question this reply answers, if GHL didn't say. The tag
+    # equity-value-yes is added when they say yes to the first one, so its
+    # presence means the reply in hand is the answer to the second.
+    step = req.step
+    if not step:
+        tags = (req.tags or "").lower()
+        step = "see_options" if "equity-value-yes" in tags else "value_offer"
+
     if _opted_out(req.answer):
         log.info("equity opt-out from %s", req.phone)
         return {
-            "step": req.step, "answer": "opt_out", "next_message": None,
+            "step": step, "answer": "opt_out", "next_message": None,
             "fire_salesperson_alert": False,
             "tags": ["equity-opted-out"],
             "note": "Honour STOP store-wide, not just in this workflow.",
         }
 
     # ── Question 1: do you want to know what it's worth? ─────────────────────
-    if req.step == "value_offer":
+    if step == "value_offer":
         if yes is True:
             push = await _push_to_ghl(req.dealer_key, {
                 "phone": req.phone,
@@ -673,7 +686,7 @@ async def equity_response(req: ResponseRequest):
                 "equity_message": SEE_OPTIONS_MESSAGE,
             }, kind="Q2")
             return {
-                "step": req.step, "answer": "yes",
+                "step": step, "answer": "yes",
                 "next_message": SEE_OPTIONS_MESSAGE,
                 "next_step": "see_options",
                 "fire_salesperson_alert": False,
@@ -682,7 +695,7 @@ async def equity_response(req: ResponseRequest):
             }
         if yes is False:
             return {
-                "step": req.step, "answer": "no",
+                "step": step, "answer": "no",
                 "next_message": DECLINE_MESSAGE,
                 "fire_salesperson_alert": False,
                 "tags": ["equity-declined"],
@@ -690,14 +703,14 @@ async def equity_response(req: ResponseRequest):
                          f"last_declined_date on the contact."),
             }
         return {
-            "step": req.step, "answer": "unclear",
+            "step": step, "answer": "unclear",
             "next_message": None, "fire_salesperson_alert": False,
             "tags": ["equity-reply-unclear"],
             "note": "Reply wasn't a clear yes or no — route to a human, don't guess.",
         }
 
     # ── Question 2: want to look at options while you're here? ───────────────
-    if req.step == "see_options":
+    if step == "see_options":
         if yes is True:
             _clean_claims()
             if req.phone:
@@ -734,7 +747,7 @@ async def equity_response(req: ResponseRequest):
                 "appointment_time": req.appointment_time,
             }, kind="ALERT")
             return {
-                "step": req.step, "answer": "yes",
+                "step": step, "answer": "yes",
                 "next_message": CONFIRM_MESSAGE,
                 "fire_salesperson_alert": True,
                 # The desk gets this as an SMS too, so it takes the same
@@ -752,7 +765,7 @@ async def equity_response(req: ResponseRequest):
             }
         if yes is False:
             return {
-                "step": req.step, "answer": "no",
+                "step": step, "answer": "no",
                 "next_message": VALUE_ONLY_MESSAGE,
                 "fire_salesperson_alert": False,
                 "tags": ["equity-value-yes", "equity-options-no"],
@@ -760,12 +773,12 @@ async def equity_response(req: ResponseRequest):
                          "over. Do not send a salesperson to the lounge."),
             }
         return {
-            "step": req.step, "answer": "unclear", "next_message": None,
+            "step": step, "answer": "unclear", "next_message": None,
             "fire_salesperson_alert": False,
             "tags": ["equity-reply-unclear"],
         }
 
-    return {"error": "unknown_step", "step": req.step,
+    return {"error": "unknown_step", "step": step,
             "note": "step must be 'value_offer' or 'see_options'"}
 
 

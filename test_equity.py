@@ -410,3 +410,30 @@ def test_per_store_env_var_wins_over_the_default(monkeypatch):
     assert equity._equity_webhook_url("mcgrath_kia_stcharles") == "https://default/hook"
     # Each purpose resolves to its own workflow.
     assert equity._equity_webhook_url("mcgrath_kia_stcharles", "Q2") == "https://q2/hook"
+
+
+# ── Working out which question a reply answers ───────────────────────────────
+def test_step_is_inferred_from_the_contact_tags():
+    """GHL sends {{contact.tags}} instead of branching on a Condition -- the
+    Condition action is where this build kept getting stuck."""
+    first = respond(answer="yes", phone="6305550147", tags="equity-texted")
+    assert first["step"] == "value_offer"
+    assert first["fire_salesperson_alert"] is False
+
+    second = respond(answer="yes", phone="6305550147",
+                     tags="equity-texted, equity-value-yes")
+    assert second["step"] == "see_options"
+    assert second["fire_salesperson_alert"] is True
+
+
+def test_explicit_step_still_wins_over_tags():
+    r = respond(step="value_offer", answer="yes", phone="6305550147",
+                tags="equity-texted, equity-value-yes")
+    assert r["step"] == "value_offer"
+
+
+def test_stop_works_whichever_question_they_are_on():
+    for tags in ("equity-texted", "equity-texted, equity-value-yes"):
+        r = respond(answer="STOP", phone="6305550147", tags=tags)
+        assert r["answer"] == "opt_out"
+        assert "equity-opted-out" in r["tags"]
