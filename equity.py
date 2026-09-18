@@ -50,6 +50,7 @@ import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter
@@ -84,6 +85,9 @@ LEASE_HOT_MONTHS = 6
 CLAIM_TIMEOUT_SECONDS = 5 * 60
 
 HOT, WARM, COLD = "hot", "warm", "cold"
+
+# All McGrath stores are in Illinois.
+DEALER_TZ = ZoneInfo("America/Chicago")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,14 +538,29 @@ async def equity_screen(req: ScreenRequest):
     """
     label = _vehicle_label(req)
 
-    # Fill the vehicle from myKaarma if GHL didn't have it.
-    if not label and (req.phone or req.customer_uuid):
+    # One myKaarma round trip fills in whatever GHL didn't send: the vehicle,
+    # the first name, and — the important one — WHEN the appointment actually
+    # is. GHL fires this workflow the moment the appointment is booked, which
+    # can be days ahead of the visit, and the text says "while you're in for
+    # service today". Without the real appointment time it would go out on the
+    # day they booked. myKaarma is the only place that time exists.
+    if req.phone or req.customer_uuid:
         try:
             dealer = get_dealer(req.dealer_key)
             matches = await mk.search_customer(dealer, phone=req.phone)
             if matches:
                 c = mk.parse_search_match(matches[0])
-                if c["vehicles"]:
+                if not req.appointment_time and c.get("customer_uuid"):
+                    try:
+                        appts = await mk.get_customer_appointments(
+                            dealer, c["customer_uuid"])
+                        now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+                        upcoming = mk.upcoming_appointments(appts, now_local)
+                        if upcoming:
+                            req.appointment_time = upcoming[0].get("start_time")
+                    except mk.MyKaarmaError as e:
+                        log.warning("appointment read failed: %s", e)
+                if not label and c["vehicles"]:
                     label = c["vehicles"][0]["label"]
                     # Split it out, not just the year. The text names the MODEL
                     # ("Used CR-Vs are in short supply"), so without this every
@@ -603,6 +622,7 @@ async def equity_screen(req: ScreenRequest):
         "equity_priority_reasons": "; ".join(pri["reasons"]),
         "appointment_day": req.appointment_day,
         "appointment_time": req.appointment_time,
+        "send_at": req.appointment_time,
     })
 
     return {

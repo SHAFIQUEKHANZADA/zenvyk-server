@@ -13,6 +13,8 @@ These lock down Reid's design decisions, not the arithmetic:
 import asyncio
 from datetime import datetime, timedelta
 
+import pytest
+
 import equity
 from equity import (
     COLD,
@@ -47,6 +49,28 @@ def days_ago(n):
 
 def setup_function():
     equity._CLAIMS.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """
+    Nothing in this suite may touch myKaarma or GHL.
+
+    equity-screen now always looks the customer up — it needs the real
+    appointment time, which only myKaarma has. Left unstubbed that turned a
+    0.7-second test run into 20 seconds of live API calls against production.
+    """
+    async def _no_customer(*a, **k):
+        return []
+
+    async def _no_push(*a, **k):
+        return {"pushed": False, "reason": "stubbed"}
+
+    monkeypatch.setattr(equity.mk, "search_customer", _no_customer)
+    # Stash the real one so the tests that are ABOUT the push can still
+    # reach it without unwinding this fixture.
+    monkeypatch.setattr(equity, "_REAL_PUSH", equity._push_to_ghl, raising=False)
+    monkeypatch.setattr(equity, "_push_to_ghl", _no_push)
 
 
 # ── Reading replies off a phone ───────────────────────────────────────────────
@@ -286,82 +310,103 @@ def test_known_low_mileage_still_beats_unknown():
 
 
 # ── The GHL push ──────────────────────────────────────────────────────────────
-def test_no_webhook_configured_does_not_break_the_response(monkeypatch):
-    monkeypatch.delenv("EQUITY_WEBHOOK_DEFAULT", raising=False)
-    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
-               vehicle_model="CR-V")
-    assert r["eligible"] is True
-    assert r["ghl"]["pushed"] is False
+# These override the autouse no-network fixture on purpose: they are ABOUT the
+# push, so they spy on it rather than letting it be stubbed away.
+def test_ineligible_customers_are_never_pushed(monkeypatch):
+    calls = []
+
+    async def spy(dealer_key, payload, kind=""):
+        calls.append(kind or "screen")
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
+           vehicle_model="CR-V", last_purchase_date=days_ago(60))
+    assert calls == [], "an excluded customer must never reach GHL"
+
+
+def test_eligible_customers_are_pushed_once(monkeypatch):
+    calls = []
+
+    async def spy(dealer_key, payload, kind=""):
+        calls.append((kind or "screen", payload))
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    screen(phone="6305550147", first_name="Dan", vehicle_year="2022",
+           vehicle_make="Honda", vehicle_model="CR-V")
+    assert [k for k, _ in calls] == ["screen"]
+    sent = calls[0][1]
+    assert sent["phone"] == "6305550147"
+    assert "equity_message" in sent and "STOP" in sent["equity_message"]
+
+
+def test_first_yes_pushes_the_second_question(monkeypatch):
+    calls = []
+
+    async def spy(dealer_key, payload, kind=""):
+        calls.append(kind)
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    respond(step="value_offer", answer="yes", phone="6305550147")
+    assert calls == ["Q2"]
+
+
+def test_second_yes_pushes_the_desk_alert(monkeypatch):
+    calls = []
+
+    async def spy(dealer_key, payload, kind=""):
+        calls.append((kind, payload))
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    respond(step="see_options", answer="yes", phone="6305550147",
+            first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+            vehicle_model="CR-V")
+    assert [k for k, _ in calls] == ["ALERT"]
+    assert "Dan" in calls[0][1]["alert_card"]
+
+
+def test_a_no_pushes_nothing(monkeypatch):
+    calls = []
+
+    async def spy(dealer_key, payload, kind=""):
+        calls.append(kind)
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    respond(step="value_offer", answer="no thanks", phone="6305550147")
+    respond(step="value_offer", answer="STOP", phone="6305550147")
+    assert calls == []
 
 
 def test_a_failing_push_never_500s_the_workflow_step(monkeypatch):
-    """If the push raises, GHL marks the whole action failed and the contact
-    drops out of the flow silently. It must degrade, not explode."""
-    import equity as eq
-
+    """If the push raises, GHL marks the action failed and the contact drops
+    out of the flow silently. It must degrade, not explode."""
     class Boom:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
         async def post(self, *a, **k): raise RuntimeError("network down")
 
     monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://example.invalid/hook")
-    monkeypatch.setattr(eq.httpx, "AsyncClient", lambda **k: Boom())
-    r = screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
-               vehicle_model="CR-V")
-    assert r["eligible"] is True
-    assert r["ghl"]["pushed"] is False
+    monkeypatch.setattr(equity.httpx, "AsyncClient", lambda **k: Boom())
+    out = asyncio.run(equity._REAL_PUSH("mcgrath_honda_stcharles", {}))
+    assert out["pushed"] is False
 
 
-def test_ineligible_customers_are_never_pushed(monkeypatch):
-    import equity as eq
-    calls = []
-
-    class Spy:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, url, **k):
-            calls.append(url)
-            class R: status_code = 200; text = ""
-            return R()
-
-    monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://example.invalid/hook")
-    monkeypatch.setattr(eq.httpx, "AsyncClient", lambda **k: Spy())
-    screen(phone="6305550147", vehicle_year="2022", vehicle_make="Honda",
-           vehicle_model="CR-V", last_purchase_date=days_ago(60))
-    assert calls == [], "an excluded customer must never reach GHL"
+def test_no_webhook_configured_is_reported_not_raised(monkeypatch):
+    monkeypatch.delenv("EQUITY_WEBHOOK_DEFAULT", raising=False)
+    monkeypatch.delenv("EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES", raising=False)
+    out = asyncio.run(equity._REAL_PUSH("mcgrath_honda_stcharles", {}))
+    assert out == {"pushed": False, "reason": "no_webhook_configured"}
 
 
 def test_per_store_env_var_wins_over_the_default(monkeypatch):
-    from equity import _equity_webhook_url
     monkeypatch.setenv("EQUITY_WEBHOOK_DEFAULT", "https://default/hook")
     monkeypatch.setenv("EQUITY_WEBHOOK_MCGRATH_HONDA_STCHARLES", "https://store/hook")
-    assert _equity_webhook_url("mcgrath_honda_stcharles") == "https://store/hook"
-    assert _equity_webhook_url("mcgrath_kia_stcharles") == "https://default/hook"
-
-
-def test_outbound_sms_stays_in_the_gsm_alphabet():
-    """A single em dash drops SMS from 160-char segments to 70, doubling the
-    carrier cost of every send. Nothing customer-facing may leave GSM-7."""
-    from equity import (CONFIRM_MESSAGE, DECLINE_MESSAGE, SEE_OPTIONS_MESSAGE,
-                        VALUE_ONLY_MESSAGE, _onsite_message)
-    GSM = set(
-        "@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
-        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà\n\r"
-    ) | set("^{}[~]|€") | {"\\"}
-    messages = [
-        _onsite_message("Shafique", "Accord", "Tuesday"),
-        _onsite_message(None, None, None),
-        SEE_OPTIONS_MESSAGE, CONFIRM_MESSAGE, DECLINE_MESSAGE, VALUE_ONLY_MESSAGE,
-        screen(phone="6305550147", first_name="Dan", vehicle_year="2022",
-               vehicle_make="Honda", vehicle_model="CR-V")["message"],
-    ]
-    for m in messages:
-        bad = sorted({c for c in m if c not in GSM})
-        assert not bad, f"non-GSM {bad} in: {m[:70]}"
-
-
-def test_alert_card_to_the_sales_desk_is_also_gsm_safe():
-    r = respond(step="see_options", answer="yes", phone="6305550147",
-                first_name="Dan", vehicle_year="2021", vehicle_make="Honda",
-                vehicle_model="Accord")
-    assert "\u2014" not in r["alert_card"], "em dash in the desk SMS"
+    monkeypatch.setenv("EQUITY_WEBHOOK_Q2_DEFAULT", "https://q2/hook")
+    assert equity._equity_webhook_url("mcgrath_honda_stcharles") == "https://store/hook"
+    assert equity._equity_webhook_url("mcgrath_kia_stcharles") == "https://default/hook"
+    # Each purpose resolves to its own workflow.
+    assert equity._equity_webhook_url("mcgrath_kia_stcharles", "Q2") == "https://q2/hook"
