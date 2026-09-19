@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from equity import router as equity_router
+from equity_board import router as equity_board_router
 from routes import router as mykaarma_router
 
 load_dotenv()
@@ -57,6 +58,9 @@ app.add_middleware(
 app.include_router(mykaarma_router)
 # Trade equity mining — same /mykaarma prefix, separate module.
 app.include_router(equity_router)
+# The salesperson's claim screen. Registered AFTER the equity router so its
+# literal /equity-board path is matched before /{dealer_key}/... swallows it.
+app.include_router(equity_board_router)
 
 
 @app.get("/")
@@ -73,6 +77,7 @@ def root():
             "POST /mykaarma/equity-response",
             "POST /mykaarma/equity-claim",
             "GET  /mykaarma/equity-claims",
+            "GET  /mykaarma/equity-board   (salesperson claim screen)",
         ],
         "docs": "/docs",
     }
