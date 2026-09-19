@@ -11,6 +11,7 @@ These lock down Reid's design decisions, not the arithmetic:
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -867,3 +868,77 @@ def test_an_unparseable_time_is_shown_rather_than_dropped():
     r = respond(step="see_options", answer="yes", phone="6305550147",
                 first_name="Dan", appointment_time="whenever they turn up")
     assert "whenever they turn up" in r["alert_card"]
+
+
+# ── The accountability funnel ────────────────────────────────────────────────
+# Reid's report is: how many said yes, how many agreed to talk, who walked
+# over, and what came of it. Nothing in myKaarma or GHL knows a salesperson
+# went to the lounge, so the claim screen logs it.
+
+@pytest.fixture
+def claim_spy(monkeypatch):
+    seen = []
+
+    async def _claimed(dealer_key, phone, salesperson):
+        seen.append(("claimed", phone, salesperson))
+        return {"written": True}
+
+    async def _outcome(dealer_key, phone, outcome):
+        seen.append(("outcome", phone, outcome))
+        return {"written": True}
+
+    async def _release(dealer_key, phone):
+        seen.append(("release", phone, None))
+        return {"written": True}
+
+    monkeypatch.setattr(equity.dashboard, "mark_claimed", _claimed)
+    monkeypatch.setattr(equity.dashboard, "mark_outcome", _outcome)
+    monkeypatch.setattr(equity.dashboard, "release_claim", _release)
+    return seen
+
+
+def _live_claim(phone="6305550147"):
+    equity._CLAIMS[phone] = {
+        "phone": phone, "name": "Dan", "vehicle": "2022 Honda CR-V",
+        "dealer_key": "mcgrath_honda_stcharles", "appointment_time": "Tue 9:30 AM",
+        "priority_score": 72, "priority_band": HOT, "reasons": [],
+        "status": "unclaimed", "salesperson": None, "at": time.time(),
+    }
+
+
+def test_a_claim_is_recorded_against_the_appraisal(claim_spy):
+    _live_claim()
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    assert ("claimed", "6305550147", "Mitch") in claim_spy
+
+
+def test_presented_and_sold_are_recorded(claim_spy):
+    _live_claim()
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    claim(phone="6305550147", salesperson="Mitch", action="presented")
+    claim(phone="6305550147", salesperson="Mitch", action="sold")
+    outcomes = [o for kind, _, o in claim_spy if kind == "outcome"]
+    assert outcomes == ["presented", "sold"]
+
+
+def test_releasing_clears_the_salesperson_but_keeps_the_appraisal(claim_spy):
+    _live_claim()
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    claim(phone="6305550147", salesperson="Mitch", action="release")
+    assert ("release", "6305550147", None) in claim_spy
+
+
+def test_a_losing_claim_is_not_recorded(claim_spy):
+    """Two people tap Claim; only the winner goes on the record."""
+    _live_claim()
+    claim(phone="6305550147", salesperson="Mitch", action="claim")
+    claim_spy.clear()
+    second = claim(phone="6305550147", salesperson="Juan", action="claim")
+    assert second["success"] is False
+    assert claim_spy == []
+
+
+def test_claiming_a_lead_that_isnt_live_records_nothing(claim_spy):
+    out = claim(phone="0000000000", salesperson="Mitch", action="claim")
+    assert out["success"] is False
+    assert claim_spy == []

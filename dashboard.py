@@ -183,3 +183,54 @@ async def mark_wants_options(dealer_key: Optional[str],
     except Exception as e:                      # noqa: BLE001
         log.warning("wants_options update errored: %s", e)
         return {"written": False, "reason": str(e)[:200]}
+
+
+async def mark_claimed(dealer_key: Optional[str], phone: Optional[str],
+                       salesperson: Optional[str]) -> dict:
+    """A salesperson took the lead. Named on the row so the report can say who."""
+    return await _patch_appraisal(dealer_key, phone, {
+        "claimed_by": salesperson,
+        "claimed_at": "now()",
+    })
+
+
+async def mark_outcome(dealer_key: Optional[str], phone: Optional[str],
+                       outcome: Optional[str]) -> dict:
+    """
+    presented / sold / no_deal.
+
+    Reid's accountability report lives or dies on this field, and there is no
+    automatic signal that a conversation happened on the lot -- nothing in
+    myKaarma or GHL knows a salesperson walked into the lounge. It is logged by
+    hand from the claim screen, which is why those buttons are one tap.
+    """
+    return await _patch_appraisal(dealer_key, phone, {"outcome": outcome})
+
+
+async def release_claim(dealer_key: Optional[str], phone: Optional[str]) -> dict:
+    """Back on the board. The row stays -- the appraisal still happened."""
+    return await _patch_appraisal(dealer_key, phone,
+                                  {"claimed_by": None, "claimed_at": None})
+
+
+async def _patch_appraisal(dealer_key: Optional[str], phone: Optional[str],
+                           fields: Dict[str, object]) -> dict:
+    cfg = _config()
+    if not cfg or not phone:
+        return {"written": False, "reason": "not_configured_or_no_phone"}
+    url, key = cfg
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as c:
+            r = await c.patch(
+                f"{url}/rest/v1/{TABLE}",
+                params={"dealer_key": f"eq.{dealer_key}", "phone": f"eq.{phone}",
+                        "local_date": f"eq.{local_date()}"},
+                headers=_headers(key, "return=minimal"),
+                json=fields,
+            )
+        if r.status_code >= 400:
+            log.warning("appraisal patch failed [%s] %s", r.status_code, r.text[:300])
+        return {"written": r.status_code < 400, "status": r.status_code}
+    except Exception as e:                      # noqa: BLE001 - never propagate
+        log.warning("appraisal patch errored: %s", e)
+        return {"written": False, "reason": str(e)[:200]}

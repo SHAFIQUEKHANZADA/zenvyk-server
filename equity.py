@@ -1136,6 +1136,8 @@ async def equity_claim(req: ClaimRequest):
                 "message": f"{claim['salesperson']} already claimed this one.",
             }
         claim.update(status="claimed", salesperson=req.salesperson, at=time.time())
+        await dashboard.mark_claimed(claim.get("dealer_key"), req.phone,
+                                     req.salesperson)
         return {"success": True, "status": "claimed",
                 "message": f"{claim['name']} is yours — {claim['vehicle']}.",
                 "expires_in_seconds": CLAIM_TIMEOUT_SECONDS,
@@ -1143,6 +1145,7 @@ async def equity_claim(req: ClaimRequest):
 
     if req.action == "release":
         claim.update(status="unclaimed", salesperson=None, at=time.time())
+        await dashboard.release_claim(claim.get("dealer_key"), req.phone)
         return {"success": True, "status": "unclaimed",
                 "message": "Released — back on the board.",
                 "tags": ["equity-released"]}
@@ -1151,12 +1154,14 @@ async def equity_claim(req: ClaimRequest):
         # Reid's accountability funnel needs this, and there is no automatic
         # signal that a conversation happened on the lot — it has to be logged.
         claim.update(status="presented", at=time.time())
+        await dashboard.mark_outcome(claim.get("dealer_key"), req.phone, "presented")
         return {"success": True, "status": "presented",
                 "message": "Logged — options presented.",
                 "tags": ["equity-presented"]}
 
     if req.action == "sold":
         claim.update(status="sold", at=time.time())
+        await dashboard.mark_outcome(claim.get("dealer_key"), req.phone, "sold")
         return {"success": True, "status": "sold",
                 "message": "Logged — deal.",
                 "tags": ["equity-sold"]}
