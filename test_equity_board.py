@@ -119,3 +119,14 @@ def test_two_salespeople_cannot_claim_the_same_customer():
     assert second["error"] == "already_claimed"
     # The board shows this message, so it has to name who won.
     assert "Mitch" in second["message"]
+
+
+def test_an_empty_board_still_paints():
+    """The board only redraws when its signature changes. An empty board's
+    signature is the empty string, so starting lastSig at "" skipped the very
+    first paint and the page stayed blank until a customer appeared."""
+    html = client.get("/mykaarma/equity-board").text
+    assert "var lastSig = null;" in html
+    assert 'lastSig = "";' not in html
+    # And the empty state it should be painting is actually in the page.
+    assert "Nothing waiting" in html

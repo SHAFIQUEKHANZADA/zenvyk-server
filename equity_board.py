@@ -143,7 +143,10 @@ BOARD_HTML = """<!doctype html>
 
   // Buttons the finger is already on must not be yanked away by a poll landing
   // mid-tap, so a card is only redrawn when something about it actually changed.
-  var lastSig = "";
+  // null, not "": an empty board's signature is also "", so starting at ""
+  // meant the very first paint was skipped and the page stayed blank until
+  // the first customer appeared. null can never equal a real signature.
+  var lastSig = null;
   var busy = {};
 
   function askName(force){
@@ -154,7 +157,7 @@ BOARD_HTML = """<!doctype html>
     me = v || "Sales";
     try { localStorage.setItem("equity_me", me); } catch (e) {}
     whoEl.textContent = me;
-    lastSig = "";
+    lastSig = null;
     load();
   }
   whoEl.textContent = me || "Set your name";
@@ -245,7 +248,7 @@ BOARD_HTML = """<!doctype html>
       show("No connection. Try again.");
     }).then(function(){
       delete busy[phone];
-      lastSig = "";
+      lastSig = null;
       load();
     });
   }
