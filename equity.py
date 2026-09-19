@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import mykaarma_client as mk
 from config import DEALERS, DEFAULT_DEALER_KEY, get_dealer, DealerNotConfigured
@@ -184,6 +184,13 @@ class ScreenRequest(BaseModel):
 
 
 class ResponseRequest(BaseModel):
+    # Keep whatever else GHL sends. The inbound message body has turned up
+    # under several different names depending on which trigger fired and how
+    # the webhook step was configured, and a reply we can't read looks exactly
+    # like a customer who typed something ambiguous -- which is the one failure
+    # that is invisible from the outside.
+    model_config = ConfigDict(extra="allow")
+
     dealer_key: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -337,6 +344,42 @@ def _vehicle_label(req) -> str:
     return " ".join(
         str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
     ).strip()
+
+
+# Where GHL has been seen to put the inbound message body. The workflow's
+# webhook step maps {{message.body}} into `answer`, but that merge field
+# resolves to an empty string under some triggers -- which is what happened on
+# the 19 Sep test: the reply was a plain "yes" and the server scored it
+# "unclear" because nothing arrived in `answer` at all.
+#
+# Rather than depend on one merge field being wired correctly in seven stores,
+# take the first non-empty of the usual suspects. Anything GHL sends that the
+# model doesn't declare is kept (extra="allow"), so this also picks up the
+# standard payload without the webhook step needing custom data for it.
+_ANSWER_KEYS = (
+    "answer", "message", "message_body", "messageBody", "body",
+    "last_message", "lastMessage", "sms", "text", "contact_reply",
+)
+
+
+def _answer_text(req) -> Optional[str]:
+    direct = (req.answer or "").strip()
+    if direct:
+        return direct
+
+    extras = getattr(req, "model_extra", None) or {}
+    for key in _ANSWER_KEYS:
+        value = extras.get(key)
+        if isinstance(value, dict):          # {"body": "yes"}
+            value = value.get("body") or value.get("text")
+        if isinstance(value, str) and value.strip():
+            log.info("reply text recovered from %r, not `answer`", key)
+            return value.strip()
+
+    if extras:
+        log.warning("no reply text in the webhook payload; keys seen: %s",
+                    sorted(extras)[:20])
+    return None
 
 
 def _opted_out(answer: Optional[str]) -> bool:
@@ -697,7 +740,8 @@ async def equity_response(req: ResponseRequest):
     what the car is worth is not the same as wanting to be approached.
     """
     label = _vehicle_label(req)
-    yes = _is_yes(req.answer)
+    answer = _answer_text(req)
+    yes = _is_yes(answer)
     pri = _priority(req)
 
     # Work out which question this reply answers, if GHL didn't say. The tag
@@ -705,7 +749,7 @@ async def equity_response(req: ResponseRequest):
     # presence means the reply in hand is the answer to the second.
     step = req.step or _resolve_step(req.phone, req.tags)
 
-    if _opted_out(req.answer):
+    if _opted_out(answer):
         log.info("equity opt-out from %s", req.phone)
         return {
             "step": step, "answer": "opt_out", "next_message": None,
@@ -771,6 +815,11 @@ async def equity_response(req: ResponseRequest):
             }
         return {
             "step": step, "answer": "unclear",
+            # Echoed so the GHL execution log shows what actually arrived. An
+            # empty `received` means the webhook step isn't sending the message
+            # body, not that the customer typed something odd -- and those two
+            # look identical from the GHL side.
+            "received": answer,
             "next_message": None, "fire_salesperson_alert": False,
             "tags": ["equity-reply-unclear"],
             "note": "Reply wasn't a clear yes or no — route to a human, don't guess.",
@@ -842,6 +891,7 @@ async def equity_response(req: ResponseRequest):
             }
         return {
             "step": step, "answer": "unclear", "next_message": None,
+            "received": answer,
             "fire_salesperson_alert": False,
             "tags": ["equity-reply-unclear"],
         }

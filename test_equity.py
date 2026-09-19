@@ -503,3 +503,62 @@ def test_stop_works_whichever_question_they_are_on():
     assert respond(answer="STOP", phone="6305550147")["answer"] == "opt_out"
     respond(answer="yes", phone="6305550147")          # now on question two
     assert respond(answer="STOP", phone="6305550147")["answer"] == "opt_out"
+
+
+# ── The reply text going missing (19 Sep) ────────────────────────────────────
+# GHL's webhook step mapped {{message.body}} into `answer`, and it arrived
+# empty. A plain "yes" scored "unclear" and the thread stopped dead. From the
+# GHL execution log that is indistinguishable from a customer typing something
+# ambiguous, which is why it took a day to find.
+
+def test_reply_text_is_recovered_when_answer_arrives_empty():
+    r = respond(step="value_offer", answer="", phone="6305550147",
+                first_name="Dan", message="yes")
+    assert r["answer"] == "yes"
+    assert r["next_step"] == "see_options"
+
+
+@pytest.mark.parametrize("key", ["message", "message_body", "messageBody",
+                                 "body", "last_message", "sms", "text"])
+def test_every_known_message_key_is_accepted(key):
+    r = respond(**{"step": "value_offer", "phone": "6305550147", key: "yes"})
+    assert r["answer"] == "yes"
+
+
+def test_nested_message_object_is_read():
+    r = respond(step="value_offer", phone="6305550147",
+                message={"body": "sure thing"})
+    assert r["answer"] == "yes"
+
+
+def test_an_explicit_answer_still_wins_over_the_extras():
+    r = respond(step="value_offer", answer="no thanks", phone="6305550147",
+                message="yes")
+    assert r["answer"] == "no"
+
+
+def test_stop_is_honoured_when_it_arrives_in_an_extra_field():
+    r = respond(step="value_offer", phone="6305550147", message="STOP")
+    assert r["answer"] == "opt_out"
+    assert "equity-opted-out" in r["tags"]
+
+
+def test_unclear_echoes_what_actually_arrived():
+    """So the GHL log distinguishes "nothing was sent" from "they typed
+    something odd" -- the two look identical otherwise."""
+    empty = respond(step="value_offer", phone="6305550147")
+    assert empty["answer"] == "unclear"
+    assert empty["received"] is None
+
+    # "maybe later" reads as a decline, so pick something genuinely ambiguous.
+    odd = respond(step="value_offer", answer="what do you mean",
+                  phone="6305550147")
+    assert odd["answer"] == "unclear"
+    assert odd["received"] == "what do you mean"
+
+
+def test_unclear_on_the_second_question_echoes_too():
+    r = respond(step="see_options", answer="what do you mean",
+                phone="6305550147")
+    assert r["answer"] == "unclear"
+    assert r["received"] == "what do you mean"
