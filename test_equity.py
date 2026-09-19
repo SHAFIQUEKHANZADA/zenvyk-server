@@ -762,3 +762,41 @@ def test_a_decline_containing_a_yes_word_is_still_a_decline():
     assert _is_yes("not interested") is False
     assert _is_yes("no thanks im good") is False
     assert _is_yes("ok but not today") is False
+
+
+# ── Brand-new cars (found live, 19 Sep) ──────────────────────────────────────
+# A real customer in for a tire replacement on a 2026 Civic was asked whether
+# she wanted to trade it. Reid's "no purchases in the last 12 months" rule
+# depends on last_purchase_date, which GHL does not send, so it never fired.
+# The model year is the proxy we always have.
+
+@pytest.mark.parametrize("year", ["2027", "2026", "2025"])
+def test_brand_new_vehicles_are_not_asked_to_trade(year):
+    r = screen(phone="6305550147", first_name="Nina", vehicle_year=year,
+               vehicle_make="Honda", vehicle_model="Civic")
+    assert r["eligible"] is False, year
+    assert "equity-skip-new-vehicle" in r["tags"]
+    assert r["message"] is None
+
+
+@pytest.mark.parametrize("year", ["2024", "2022", "2019"])
+def test_the_sweet_spot_still_gets_the_text(year):
+    r = screen(phone="6305550147", vehicle_year=year, vehicle_make="Honda",
+               vehicle_model="CR-V")
+    assert r["eligible"] is True, year
+
+
+def test_the_skip_reason_reads_like_a_person_wrote_it():
+    # This string ends up in front of Reid when he asks why someone was
+    # skipped, so it has to explain itself without the code beside it.
+    r = screen(phone="6305550147", vehicle_year="2026", vehicle_make="Honda",
+               vehicle_model="Civic")
+    assert "Brand new" in r["reason"]
+    assert "recent purchase" in r["reason"]
+
+
+def test_unknown_year_is_not_treated_as_brand_new():
+    """A missing year must not silently exclude everyone. myKaarma records with
+    no year on the vehicle are common."""
+    r = screen(phone="6305550147", vehicle_make="Honda", vehicle_model="CR-V")
+    assert "equity-skip-new-vehicle" not in r["tags"]

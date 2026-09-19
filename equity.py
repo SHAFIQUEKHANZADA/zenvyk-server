@@ -771,6 +771,27 @@ async def equity_screen(req: ScreenRequest):
         return blocked("Already in another campaign", "equity-skip-collision")
 
     age = _age(_year(req.vehicle_year))
+
+    # Brand-new cars. Reid's rule is "exclude purchases from the past 12
+    # months", but that depends on last_purchase_date and GHL isn't sending it,
+    # so the exclusion above never fires in practice. The model year is the
+    # proxy we always have.
+    #
+    # Found live on 19 Sep: a real customer in for a tire replacement on a 2026
+    # Civic was asked whether she wanted to trade it. Someone who took delivery
+    # weeks ago is underwater on the loan and cannot trade out of it, and being
+    # asked makes the store look like it doesn't know its own customers.
+    #
+    # Model years run ahead of the calendar, so age can be zero or negative --
+    # in September 2026 the 2027s are already on the lot.
+    if age is not None and age < AGE_SWEET_SPOT[0]:
+        how_new = "Brand new" if age <= 0 else f"{age} year old"
+        return blocked(
+            f"{how_new} vehicle — almost certainly a recent purchase, and too "
+            f"new to have equity",
+            "equity-skip-new-vehicle",
+        )
+
     if age is not None and age > AGE_SWEET_SPOT[1] + 5:
         return blocked(f"Vehicle is {age} years old — limited book value",
                        "equity-skip-old-vehicle")
