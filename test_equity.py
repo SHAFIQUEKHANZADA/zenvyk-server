@@ -460,20 +460,24 @@ def test_per_store_env_var_wins_over_the_default(monkeypatch):
 # ── Working out which question a reply answers ───────────────────────────────
 def test_the_server_remembers_which_question_is_outstanding():
     """This account's GHL offers no merge field for contact tags, so the reply
-    webhook cannot tell us which question it answers. The server tracks it."""
+    webhook cannot tell us which question it answers. GHL sends the Equity Step
+    contact field for the first reply; from there the server tracks it."""
     equity._AWAITING.clear()
-    first = respond(answer="yes", phone="6305550147")
+    first = respond(step="value_offer", answer="yes", phone="6305550147")
     assert first["step"] == "value_offer"
     assert first["fire_salesperson_alert"] is False
 
-    # The first yes pushed question two, so the NEXT reply answers that one.
+    # The first yes pushed question two, so the NEXT reply answers that one
+    # even with no step sent.
     second = respond(answer="yes", phone="6305550147")
     assert second["step"] == "see_options"
     assert second["fire_salesperson_alert"] is True
 
-    # And it is cleared afterwards, so a later visit starts from the top.
+    # Afterwards the conversation is closed. A further reply with no step is
+    # NOT assumed to be a fresh equity thread -- see
+    # test_a_reply_from_another_campaign_is_ignored.
     third = respond(answer="yes", phone="6305550147")
-    assert third["step"] == "value_offer"
+    assert third["answer"] == "not_ours"
 
 
 def test_tags_win_when_ghl_does_send_them():
@@ -485,11 +489,16 @@ def test_tags_win_when_ghl_does_send_them():
         equity._AWAITING.clear()
 
 
-def test_a_stale_conversation_starts_over():
+def test_a_stale_conversation_is_dropped_not_restarted():
+    """Four hours later the customer has left the dealership. A reply that old
+    is not question two -- and it is not a new question one either, because
+    nothing said this customer is back in for service."""
     equity._AWAITING.clear()
-    respond(answer="yes", phone="6305550147")
+    respond(step="value_offer", answer="yes", phone="6305550147")
     equity._AWAITING["6305550147"] -= equity.AWAITING_TTL_SECONDS + 1
-    assert respond(answer="yes", phone="6305550147")["step"] == "value_offer"
+    late = respond(answer="yes", phone="6305550147")
+    assert late["answer"] == "not_ours"
+    assert late["fire_salesperson_alert"] is False
 
 
 def test_explicit_step_still_wins():
@@ -800,3 +809,61 @@ def test_unknown_year_is_not_treated_as_brand_new():
     no year on the vehicle are common."""
     r = screen(phone="6305550147", vehicle_make="Honda", vehicle_model="CR-V")
     assert "equity-skip-new-vehicle" not in r["tags"]
+
+
+# ── Replies that belong to another campaign ──────────────────────────────────
+# The Equity Reply In workflow fires on "customer replied AND has tag
+# equity-texted", and nothing removes that tag. Once someone has been through
+# this flow they carry it for good, so a "yes" to a Black Friday text months
+# later arrives at this endpoint too.
+
+def test_a_reply_from_another_campaign_is_ignored():
+    equity._AWAITING.clear()
+    r = respond(answer="yes", phone="6305550147", first_name="Dan")
+    assert r["answer"] == "not_ours"
+    assert r["next_message"] is None
+    assert r["fire_salesperson_alert"] is False
+    assert r["tags"] == []
+
+
+def test_a_finished_conversation_does_not_reopen():
+    r = respond(step="done", answer="yes", phone="6305550147")
+    assert r["answer"] == "not_ours"
+
+
+def test_an_unknown_step_is_not_guessed_at():
+    r = respond(step="whatever", answer="yes", phone="6305550147")
+    assert r["answer"] == "not_ours"
+
+
+def test_nothing_is_counted_on_the_dashboard_for_a_foreign_reply(dashboard_spy):
+    equity._AWAITING.clear()
+    respond(answer="yes", phone="6305550147")
+    assert dashboard_spy["recorded"] == []
+    assert dashboard_spy["options"] == []
+
+
+def test_stop_is_honoured_even_with_no_open_conversation():
+    """A STOP is obeyed whatever thread it arrives in. The guard sits AFTER the
+    opt-out check for exactly this reason -- ignoring an opt-out because we
+    didn't recognise the conversation would be a compliance failure."""
+    equity._AWAITING.clear()
+    r = respond(answer="STOP", phone="6305550147")
+    assert r["answer"] == "opt_out"
+    assert "equity-opted-out" in r["tags"]
+
+
+# ── Appointment time on the alert card ───────────────────────────────────────
+
+def test_the_alert_card_prints_a_readable_time():
+    r = respond(step="see_options", answer="yes", phone="6305550147",
+                first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+                vehicle_model="CR-V", appointment_time="2026-09-22 09:30:00")
+    assert "2026-09-22" not in r["alert_card"], r["alert_card"]
+    assert "9:30 AM" in r["alert_card"]
+
+
+def test_an_unparseable_time_is_shown_rather_than_dropped():
+    r = respond(step="see_options", answer="yes", phone="6305550147",
+                first_name="Dan", appointment_time="whenever they turn up")
+    assert "whenever they turn up" in r["alert_card"]

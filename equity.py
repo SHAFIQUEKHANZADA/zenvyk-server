@@ -276,6 +276,62 @@ def _split_label(label: Optional[str]):
     return year, make, model
 
 
+# Formats an appointment time has arrived in: myKaarma's own
+# "2026-09-22 09:30:00", ISO from GHL, and whatever a workflow author typed by
+# hand. Parsed leniently, printed one way.
+_APPT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M", "%Y-%m-%d",
+)
+
+
+def _spoken_time(raw: Optional[str]) -> Optional[str]:
+    """
+    Turn an appointment timestamp into something a salesperson can read at a
+    glance on their phone.
+
+        2026-09-22 09:30:00  ->  Tue 9:30 AM
+        (today's date)       ->  Today 9:30 AM
+
+    A desk alert is read in about two seconds while someone is walking. Raw
+    database timestamps make the reader stop and decode, and "Tue" vs "Today"
+    is the only part of it that changes what they do next.
+
+    Anything unparseable is handed back untouched rather than dropped -- a time
+    we can't format is still better than no time at all, and if a store starts
+    sending a format we don't know, it shows up in the alert instead of
+    vanishing silently.
+    """
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    for fmt in _APPT_FORMATS:
+        try:
+            when = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return text                       # already human, or a format we don't know
+
+    today = datetime.now(DEALER_TZ).date()
+    if when.date() == today:
+        day = "Today"
+    elif (when.date() - today).days == 1:
+        day = "Tomorrow"
+    else:
+        day = when.strftime("%a")
+
+    if when.hour == 0 and when.minute == 0:
+        return day                        # date only, no time on the record
+    # %-I isn't portable to Windows, so strip the zero by hand.
+    clock = when.strftime("%I:%M %p").lstrip("0")
+    return f"{day} {clock}"
+
+
 def _days_since(raw: Optional[str]) -> Optional[int]:
     """
     Days since a date GHL handed us, or None if there isn't one.
@@ -628,7 +684,28 @@ def _expect_second_answer(phone: Optional[str]) -> None:
         _AWAITING[phone] = time.time()
 
 
-def _resolve_step(phone: Optional[str], tags=None) -> str:
+# A step that means "this customer's equity conversation is over". GHL writes
+# it to the Equity Step contact field when the thread finishes.
+STEP_DONE = "done"
+
+VALID_STEPS = {"value_offer", "see_options"}
+
+
+def _resolve_step(phone: Optional[str], tags=None) -> Optional[str]:
+    """
+    Which question is this reply answering -- or none of them?
+
+    Returning None matters as much as returning a step. The Equity Reply In
+    workflow fires on "customer replied AND has tag equity-texted", and that
+    tag is never taken off the contact. So months later, when the same person
+    replies "yes" to a Black Friday text, this endpoint is still called.
+    Defaulting to "value_offer" there would quietly count a completely
+    unrelated reply as a trade-value yes: a wrong number on Reid's dashboard,
+    and a salesperson sent to a customer who is not in the building.
+
+    So a reply is only treated as an equity reply when something positively
+    says the conversation is open.
+    """
     # Tags, if GHL gave us any, in whatever shape it sent them.
     if tags:
         text = ", ".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
@@ -640,7 +717,7 @@ def _resolve_step(phone: Optional[str], tags=None) -> str:
         return "see_options"
     if started:
         _AWAITING.pop(phone or "", None)    # stale, start again
-    return "value_offer"
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,7 +926,7 @@ async def equity_response(req: ResponseRequest):
     # Work out which question this reply answers, if GHL didn't say. The tag
     # equity-value-yes is added when they say yes to the first one, so its
     # presence means the reply in hand is the answer to the second.
-    step = req.step or _resolve_step(req.phone, req.tags)
+    step = (req.step or "").strip().lower() or _resolve_step(req.phone, req.tags)
 
     if _opted_out(answer):
         log.info("equity opt-out from %s", req.phone)
@@ -858,6 +935,27 @@ async def equity_response(req: ResponseRequest):
             "fire_salesperson_alert": False,
             "tags": ["equity-opted-out"],
             "note": "Honour STOP store-wide, not just in this workflow.",
+        }
+
+    # ── Is this reply even ours? ─────────────────────────────────────────────
+    # Deliberately AFTER the opt-out check: a STOP is honoured whatever
+    # conversation it arrives in. Everything below this point is not.
+    #
+    # The Equity Reply In workflow triggers on "customer replied AND has tag
+    # equity-texted", and nothing ever removes that tag. Once a customer has
+    # been through this flow they carry it for good, so every later reply --
+    # to a Black Friday text, to Esther, to a review request -- lands here
+    # too. Without this guard those all counted as a trade-value yes.
+    if step in (None, "", STEP_DONE) or step not in VALID_STEPS:
+        log.info("reply from %s is not an equity reply (step=%r) — ignored",
+                 req.phone, step)
+        return {
+            "step": step, "answer": "not_ours",
+            "next_message": None, "fire_salesperson_alert": False,
+            "tags": [],
+            "note": ("This contact has the equity tag but no open equity "
+                     "conversation, so the reply belongs to another campaign. "
+                     "Nothing sent, nothing counted."),
         }
 
     # ── Question 1: do you want to know what it's worth? ─────────────────────
@@ -876,7 +974,7 @@ async def equity_response(req: ResponseRequest):
             # text and an Internal Notification step using these fields.
             notice = _sms_safe("\n".join([
                 f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
-                f"In for service: {req.appointment_time or 'today'}",
+                f"In for service: {_spoken_time(req.appointment_time) or 'today'}",
                 "Said YES to a trade value — appraisal scheduled",
                 f"Priority {pri['score']}/100 ({pri['band'].upper()})",
                 "Not ready to be approached yet. Have the number ready.",
@@ -961,7 +1059,7 @@ async def equity_response(req: ResponseRequest):
             await dashboard.mark_wants_options(req.dealer_key, req.phone)
             alert = [
                 f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
-                f"In for service: {req.appointment_time or 'today'}",
+                f"In for service: {_spoken_time(req.appointment_time) or 'today'}",
                 "Wants to see options — walk over now",
                 f"Priority {pri['score']}/100 ({pri['band'].upper()})",
             ] + [f"- {r}" for r in pri["reasons"]]
