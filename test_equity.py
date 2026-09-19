@@ -562,3 +562,78 @@ def test_unclear_on_the_second_question_echoes_too():
                 phone="6305550147")
     assert r["answer"] == "unclear"
     assert r["received"] == "what do you mean"
+
+
+# ── The alert card losing the car (19 Sep live test) ─────────────────────────
+# GHL's reply webhook sends phone, name, answer and step -- nothing about the
+# vehicle. The desk alert came out as:
+#
+#     Shafique - vehicle
+#     Priority 0/100 (COLD)
+#
+# which tells a salesperson who to find and no reason to get up. The vehicle
+# now comes from myKaarma on the reply too, not just on the screen.
+
+def _fake_match(label="2022 Honda CR-V", first="Dan"):
+    year, make, model = label.split(" ", 2)
+    return [{
+        "uuid": "cust-1", "fname": first, "lname": "Tester",
+        "vehicles": [{"uuid": "veh-1", "year": year, "make": make,
+                      "model": model, "vin": "X" * 17}],
+    }]
+
+
+@pytest.fixture
+def mykaarma_knows_the_car(monkeypatch):
+    async def _search(*a, **k):
+        return _fake_match()
+
+    async def _appts(*a, **k):
+        return []
+
+    monkeypatch.setattr(equity.mk, "search_customer", _search)
+    monkeypatch.setattr(equity.mk, "get_customer_appointments", _appts)
+
+
+def test_second_yes_recovers_the_vehicle_from_mykaarma(mykaarma_knows_the_car):
+    r = respond(step="see_options", answer="yes sure", phone="6305550147",
+                first_name="Shafique", appointment_time="today")
+    assert r["fire_salesperson_alert"] is True
+    assert "CR-V" in r["alert_card"], r["alert_card"]
+    # The whole point of the score is telling the desk who to see first.
+    assert r["priority_score"] > 0
+    assert r["priority_band"] != COLD
+
+
+def test_appraisal_notice_also_names_the_car(mykaarma_knows_the_car):
+    r = respond(step="value_offer", answer="yes", phone="6305550147",
+                first_name="Shafique")
+    assert "CR-V" in r["appraisal_notice"]
+    assert r["priority_score"] > 0
+
+
+def test_lookup_is_skipped_when_ghl_already_sent_everything(monkeypatch):
+    """One round trip per reply is fine; a pointless one is not."""
+    calls = []
+
+    async def _search(*a, **k):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(equity.mk, "search_customer", _search)
+    respond(step="see_options", answer="yes", phone="6305550147",
+            first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+            vehicle_model="CR-V", appointment_time="Tue 9:00 AM")
+    assert calls == []
+
+
+def test_a_failing_lookup_still_sends_the_customer_their_reply(monkeypatch):
+    async def _boom(*a, **k):
+        raise equity.mk.MyKaarmaError(503, "myKaarma down", "search")
+
+    monkeypatch.setattr(equity.mk, "search_customer", _boom)
+    r = respond(step="see_options", answer="yes", phone="6305550147",
+                first_name="Dan")
+    # Degraded alert, unbroken thread.
+    assert r["fire_salesperson_alert"] is True
+    assert r["next_message"]

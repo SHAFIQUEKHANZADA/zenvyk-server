@@ -618,50 +618,82 @@ def _clean_claims() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # POST /mykaarma/equity-screen
 # ─────────────────────────────────────────────────────────────────────────────
+async def _fill_from_mykaarma(req) -> str:
+    """
+    Fill in whatever GHL didn't send, and return the vehicle label.
+
+    Needed in two places, for two different reasons.
+
+    On equity-screen it supplies WHEN the appointment actually is. GHL fires
+    that workflow the moment the appointment is booked, which can be days
+    ahead of the visit, and the text says "while you're in for service today".
+
+    On equity-response it supplies the CAR. GHL's reply webhook sends only the
+    phone, the name, the answer and the step -- so the salesperson alert came
+    out of the 19 Sep test reading:
+
+        Shafique - vehicle
+        Priority 0/100 (COLD)
+
+    Nobody walks across a showroom for that. The car and the score are the
+    entire reason the alert is worth reading, and myKaarma is where the car
+    lives. Adding vehicle fields to the GHL webhook instead would mean seven
+    stores each wiring four more custom fields correctly, and getting them
+    wrong looks exactly like this did.
+
+    Never raises: a lookup that fails degrades the alert, it does not break
+    the customer's thread.
+    """
+    label = _vehicle_label(req)
+    if label and req.appointment_time and req.first_name:
+        return label                      # nothing to fetch
+    if not (req.phone or getattr(req, "customer_uuid", None)):
+        return label
+
+    try:
+        dealer = get_dealer(req.dealer_key)
+        matches = await mk.search_customer(dealer, phone=req.phone)
+        if not matches:
+            return label
+        c = mk.parse_search_match(matches[0])
+
+        if not req.appointment_time and c.get("customer_uuid"):
+            try:
+                appts = await mk.get_customer_appointments(
+                    dealer, c["customer_uuid"])
+                now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
+                upcoming = mk.upcoming_appointments(appts, now_local)
+                if upcoming:
+                    req.appointment_time = upcoming[0].get("start_time")
+            except mk.MyKaarmaError as e:
+                log.warning("appointment read failed: %s", e)
+
+        if not label and c["vehicles"]:
+            label = c["vehicles"][0]["label"]
+            # Split it out, not just the year. The text names the MODEL
+            # ("Used CR-Vs are in short supply"), so without this every
+            # myKaarma-sourced customer gets the generic "vehicles like
+            # yours" wording instead.
+            y, make, model = _split_label(label)
+            req.vehicle_year = str(y or "")
+            req.vehicle_make = req.vehicle_make or make
+            req.vehicle_model = req.vehicle_model or model
+
+        if not req.first_name:
+            req.first_name = c.get("first_name")
+    except (DealerNotConfigured, mk.MyKaarmaError) as e:
+        log.warning("myKaarma lookup failed for %s (%s)", req.phone, e)
+
+    return label
+
+
 @router.post("/equity-screen")
 async def equity_screen(req: ScreenRequest):
     """
     Runs when a service appointment is booked. Says whether this customer should
     get the pre-arrival text at all, and hands back the exact message to send.
     """
-    label = _vehicle_label(req)
-
-    # One myKaarma round trip fills in whatever GHL didn't send: the vehicle,
-    # the first name, and — the important one — WHEN the appointment actually
-    # is. GHL fires this workflow the moment the appointment is booked, which
-    # can be days ahead of the visit, and the text says "while you're in for
-    # service today". Without the real appointment time it would go out on the
-    # day they booked. myKaarma is the only place that time exists.
-    if req.phone or req.customer_uuid:
-        try:
-            dealer = get_dealer(req.dealer_key)
-            matches = await mk.search_customer(dealer, phone=req.phone)
-            if matches:
-                c = mk.parse_search_match(matches[0])
-                if not req.appointment_time and c.get("customer_uuid"):
-                    try:
-                        appts = await mk.get_customer_appointments(
-                            dealer, c["customer_uuid"])
-                        now_local = datetime.now(DEALER_TZ).replace(tzinfo=None)
-                        upcoming = mk.upcoming_appointments(appts, now_local)
-                        if upcoming:
-                            req.appointment_time = upcoming[0].get("start_time")
-                    except mk.MyKaarmaError as e:
-                        log.warning("appointment read failed: %s", e)
-                if not label and c["vehicles"]:
-                    label = c["vehicles"][0]["label"]
-                    # Split it out, not just the year. The text names the MODEL
-                    # ("Used CR-Vs are in short supply"), so without this every
-                    # myKaarma-sourced customer gets the generic "vehicles like
-                    # yours" wording instead.
-                    y, make, model = _split_label(label)
-                    req.vehicle_year = str(y or "")
-                    req.vehicle_make = req.vehicle_make or make
-                    req.vehicle_model = req.vehicle_model or model
-                if not req.first_name:
-                    req.first_name = c.get("first_name")
-        except (DealerNotConfigured, mk.MyKaarmaError) as e:
-            log.warning("equity-screen lookup failed (%s)", e)
+    label = await _fill_from_mykaarma(req)
 
     def blocked(reason: str, tag: str):
         log.info("equity-screen SKIP %s — %s", req.phone, reason)
@@ -739,7 +771,7 @@ async def equity_response(req: ResponseRequest):
     Reid was specific that the alert waits for the SECOND yes. Wanting to know
     what the car is worth is not the same as wanting to be approached.
     """
-    label = _vehicle_label(req)
+    label = await _fill_from_mykaarma(req)
     answer = _answer_text(req)
     yes = _is_yes(answer)
     pri = _priority(req)
