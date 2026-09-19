@@ -718,17 +718,46 @@ async def equity_response(req: ResponseRequest):
     if step == "value_offer":
         if yes is True:
             _expect_second_answer(req.phone)
+            # Reid, 19 Sep: "Can we get an alert when somebody says yes to the
+            # appraisal." That is THIS yes, not the second one. Until now the
+            # desk heard nothing until the customer also agreed to be walked
+            # over, so a yes that stalled at question two was invisible.
+            #
+            # The notice rides along inside the Q2 push rather than going to a
+            # webhook of its own: GHL inbound webhook triggers are premium and
+            # billed per execution, and the Q2 workflow is already firing at
+            # exactly this moment. One execution, two outcomes -- the customer
+            # text and an Internal Notification step using these fields.
+            notice = _sms_safe("\n".join([
+                f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
+                f"In for service: {req.appointment_time or 'today'}",
+                "Said YES to a trade value — appraisal scheduled",
+                f"Priority {pri['score']}/100 ({pri['band'].upper()})",
+                "Not ready to be approached yet. Have the number ready.",
+            ]))
             push = await _push_to_ghl(req.dealer_key, {
                 "phone": req.phone,
                 "first_name": req.first_name,
                 "equity_message": SEE_OPTIONS_MESSAGE,
+                "appraisal_notice": notice,
+                "vehicle": label,
+                "appointment_time": req.appointment_time,
+                "equity_priority_band": pri["band"],
+                "equity_priority_score": pri["score"],
             }, kind="Q2")
             return {
                 "step": step, "answer": "yes",
                 "next_message": SEE_OPTIONS_MESSAGE,
                 "next_step": "see_options",
+                # Still false: this notice tells the desk to have a number
+                # ready, it does not send anyone across the showroom. Walking
+                # over on this yes is the thing Reid explicitly ruled out.
                 "fire_salesperson_alert": False,
-                "tags": ["equity-value-yes"],
+                "appraisal_scheduled": True,
+                "appraisal_notice": notice,
+                "priority_score": pri["score"],
+                "priority_band": pri["band"],
+                "tags": ["equity-value-yes", "equity-appraisal-scheduled"],
                 "ghl": push,
             }
         if yes is False:

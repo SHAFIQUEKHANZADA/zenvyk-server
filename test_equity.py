@@ -155,6 +155,51 @@ def test_first_yes_does_not_fire_the_alert():
     assert r["next_step"] == "see_options"
 
 
+def test_first_yes_notifies_the_desk_that_an_appraisal_is_scheduled():
+    """Reid, 19 Sep: "Can we get an alert when somebody says yes to the
+    appraisal." Before this the desk heard nothing until the second yes, so a
+    customer who stalled at question two was invisible to the store."""
+    r = respond(step="value_offer", answer="yes", phone="6305550147",
+                first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+                vehicle_model="CR-V", appointment_time="Tue 9:00 AM")
+    assert r["appraisal_scheduled"] is True
+    assert "equity-appraisal-scheduled" in r["tags"]
+    notice = r["appraisal_notice"]
+    assert "Dan" in notice and "CR-V" in notice
+    # The desk must be told to prepare, NOT to walk over. Those are different
+    # instructions and confusing them is the failure Reid warned about.
+    assert "walk over" not in notice.lower()
+    assert r["fire_salesperson_alert"] is False
+
+
+def test_appraisal_notice_rides_inside_the_existing_q2_push(monkeypatch):
+    """Not its own webhook. GHL inbound triggers are billed per execution and
+    the Q2 workflow already runs at this exact moment."""
+    sent = []
+
+    async def spy(dealer_key, payload, kind=""):
+        sent.append((kind, payload))
+        return {"pushed": True}
+
+    monkeypatch.setattr(equity, "_push_to_ghl", spy)
+    respond(step="value_offer", answer="yes", phone="6305550147",
+            first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+            vehicle_model="CR-V")
+
+    assert [k for k, _ in sent] == ["Q2"], "one push only, no second webhook"
+    payload = sent[0][1]
+    assert payload["appraisal_notice"]
+    # The customer's next text still has to be in there, or the thread stops.
+    assert payload["equity_message"] == equity.SEE_OPTIONS_MESSAGE
+
+
+def test_appraisal_notice_never_states_a_figure():
+    r = respond(step="value_offer", answer="yes", phone="6305550147",
+                first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+                vehicle_model="CR-V")
+    assert "$" not in r["appraisal_notice"]
+
+
 def test_second_yes_fires_the_alert():
     r = respond(step="see_options", answer="sure", phone="6305550147",
                 first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
