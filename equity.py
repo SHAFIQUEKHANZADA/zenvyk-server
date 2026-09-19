@@ -320,24 +320,72 @@ def _days_since(raw: Optional[str]) -> Optional[int]:
     return None
 
 
+# Stretched letters are how people type enthusiasm: "yessss", "sureee",
+# "okkk". Three or more of the same letter collapse to one so the patterns
+# below don't have to enumerate every spelling.
+_STRETCH = re.compile(r"(.)\1{2,}")
+
+# Whole-message replies that are agreement but contain no word. A bare "k" is
+# "ok"; inside a sentence it is far more likely a typo or an initial, so these
+# only count as the entire message.
+_BARE_YES = {"k", "kk", "\U0001F44D", "\U0001F44C", "✅", "\U0001F64C"}
+
+
 def _is_yes(answer: Optional[str]) -> Optional[bool]:
     """
     True / False / None for "they replied something we can't read".
-    Checked against how people actually reply to a text, not a form.
+
+    Checked against how people actually reply to a text, not a form. The
+    unreadable case is deliberate and stays: a reply we can't classify goes to
+    a human rather than being guessed at, because guessing wrong sends a
+    salesperson across the showroom to someone who declined.
+
+    NO is tested before YES throughout, so "not interested" and "no thanks"
+    are never caught by the word they happen to contain.
     """
     if answer is None:
         return None
     s = str(answer).strip().lower()
+    s = _STRETCH.sub(r"\1", s)                 # yessss -> yes
+    # Apostrophes go entirely, in every form a phone keyboard produces, so the
+    # patterns below need one spelling instead of three. "we're good" and
+    # "were good" are the same refusal and both have to be caught.
+    s = re.sub(r"['‘’ʼ`]", "", s)
+    s = re.sub(r"[!.,;:*~]+", " ", s)          # "yes!!" -> "yes"
+    s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return None
+
     if re.search(r"\b(stop|unsubscribe|opt ?out|quit|remove)\b", s):
         return False
-    # "no thanks", "not now", "not interested", "nope", "n"
-    if re.search(r"\b(no|nope|nah|not (now|today|interested|right now)|pass|later)\b", s):
+
+    # Declines. "I'm good" and "we're all set" mean NO in American English --
+    # the most common polite refusal at a service desk. Reading either as a yes
+    # would walk a salesperson up to a customer who just said no, which is the
+    # single worst failure this flow can produce.
+    if re.search(
+        r"\b(no|nope|nah|naw|"
+        r"not (now|today|interested|right now|at (the )?moment)|"
+        r"no (thanks|thank you|need)|"
+        r"(i|we)m good|(i|we)re good|i am good|we are good|all set|"
+        r"another time|some other time|pass|later|busy|"
+        r"dont|do not|never ?mind)\b", s):
         return False
-    if re.search(r"\b(y|ya|yes|yeah|yep|yup|sure|ok|okay|please|absolutely|"
-                 r"definitely|sounds good|go ahead|i guess|why not)\b", s):
+
+    if re.search(
+        r"\b(y|ya|yea|yeah|yep|yup|ye|yes|"
+        r"sure|ok|okay|okey|alright|all right|fine|"
+        r"please|pls|plz|absolutely|definitely|certainly|of course|"
+        r"sounds (good|great|fine|nice)|that works|works for me|works|"
+        r"go ahead|do it|lets do it|im in|count me in|"
+        r"i guess|why not|you bet|for sure|no problem|"
+        r"interested|curious|tell me|show me|id like|would like|"
+        r"how much|whats it worth)\b", s):
         return True
+
+    if s in _BARE_YES:
+        return True
+
     return None
 
 

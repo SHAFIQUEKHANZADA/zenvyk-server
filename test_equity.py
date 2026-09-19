@@ -715,3 +715,50 @@ def test_no_supabase_config_is_a_quiet_noop(monkeypatch):
     monkeypatch.delenv("SUPABASE_SERVICE_KEY", raising=False)
     out = asyncio.run(dash.record_appraisal("mcgrath_honda_stcharles", "6305550147"))
     assert out == {"written": False, "reason": "supabase_not_configured"}
+
+
+# ── Reading agreement the way people actually text it ────────────────────────
+# From the 19 Sep live test: "sure" worked, but plenty of ordinary agreements
+# did not, and "I'm good" -- the most common polite refusal at a service desk --
+# read as unclear rather than as a no.
+
+@pytest.mark.parametrize("reply", [
+    "yes", "yeah", "yep", "y", "ya", "sure", "sure thing", "ok", "okay", "k",
+    "alright", "fine", "of course", "absolutely", "definitely", "please",
+    "pls", "that works", "works for me", "sounds good", "sounds great",
+    "go ahead", "do it", "lets do it", "let's do it", "im in", "i'm in",
+    "why not", "you bet", "for sure", "i guess", "interested", "curious",
+    "id like that", "i'd like that", "how much", "whats it worth",
+    "what's it worth", "YES!!", "yesss", "Yeah sure", "tell me more",
+])
+def test_agreements_are_read_as_yes(reply):
+    assert _is_yes(reply) is True, reply
+
+
+@pytest.mark.parametrize("reply", [
+    "no", "nope", "nah", "no thanks", "no thank you", "not interested",
+    "not right now", "not today", "im good", "i'm good", "i am good",
+    "were good", "we're good", "all set", "another time", "maybe later",
+    "never mind", "no need", "dont", "don't", "busy",
+    "STOP", "unsubscribe", "opt out",
+])
+def test_declines_are_read_as_no(reply):
+    """"I'm good" means no. Reading it as a yes walks a salesperson up to a
+    customer who just refused -- the worst failure this flow can produce."""
+    assert _is_yes(reply) is False, reply
+
+
+@pytest.mark.parametrize("reply", [
+    "what do you mean", "how does that work", "call me", "?", "maybe",
+    "who is this", "can you explain",
+])
+def test_genuinely_ambiguous_replies_still_go_to_a_human(reply):
+    """Widening the patterns must not turn "unclear" into a guess."""
+    assert _is_yes(reply) is None, reply
+
+
+def test_a_decline_containing_a_yes_word_is_still_a_decline():
+    # NO is tested first so the word inside can't flip it.
+    assert _is_yes("not interested") is False
+    assert _is_yes("no thanks im good") is False
+    assert _is_yes("ok but not today") is False
