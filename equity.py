@@ -56,6 +56,7 @@ import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
+import dashboard
 import mykaarma_client as mk
 from config import DEALERS, DEFAULT_DEALER_KEY, get_dealer, DealerNotConfigured
 
@@ -811,6 +812,17 @@ async def equity_response(req: ResponseRequest):
                 f"Priority {pri['score']}/100 ({pri['band'].upper()})",
                 "Not ready to be approached yet. Have the number ready.",
             ]))
+            # Reid watches "Appraisals Scheduled" while the customer is still
+            # in the lounge, so this is written now rather than waiting for the
+            # dashboard's 15-minute ingest. It never raises.
+            recorded = await dashboard.record_appraisal(
+                req.dealer_key, req.phone,
+                customer_name=req.first_name,
+                vehicle=label,
+                priority_score=pri["score"],
+                priority_band=pri["band"],
+                appointment_time=req.appointment_time,
+            )
             push = await _push_to_ghl(req.dealer_key, {
                 "phone": req.phone,
                 "first_name": req.first_name,
@@ -831,6 +843,7 @@ async def equity_response(req: ResponseRequest):
                 "fire_salesperson_alert": False,
                 "appraisal_scheduled": True,
                 "appraisal_notice": notice,
+                "dashboard": recorded,
                 "priority_score": pri["score"],
                 "priority_band": pri["band"],
                 "tags": ["equity-value-yes", "equity-appraisal-scheduled"],
@@ -876,6 +889,7 @@ async def equity_response(req: ResponseRequest):
                     "salesperson": None,
                     "at": time.time(),
                 }
+            await dashboard.mark_wants_options(req.dealer_key, req.phone)
             alert = [
                 f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
                 f"In for service: {req.appointment_time or 'today'}",

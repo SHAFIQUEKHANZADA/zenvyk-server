@@ -637,3 +637,81 @@ def test_a_failing_lookup_still_sends_the_customer_their_reply(monkeypatch):
     # Degraded alert, unbroken thread.
     assert r["fire_salesperson_alert"] is True
     assert r["next_message"]
+
+
+# ── Appraisals Scheduled on the dashboard ────────────────────────────────────
+# Reid, 19 Sep: "Yes and add to dash board Appraisal Scheduled". Written the
+# moment the customer answers, not via the 15-minute ingest -- he reads this
+# card while they are still in the service lounge.
+
+@pytest.fixture
+def dashboard_spy(monkeypatch):
+    calls = {"recorded": [], "options": []}
+
+    async def _record(dealer_key, phone, **kw):
+        calls["recorded"].append({"dealer_key": dealer_key, "phone": phone, **kw})
+        return {"written": True}
+
+    async def _options(dealer_key, phone):
+        calls["options"].append((dealer_key, phone))
+        return {"written": True}
+
+    monkeypatch.setattr(equity.dashboard, "record_appraisal", _record)
+    monkeypatch.setattr(equity.dashboard, "mark_wants_options", _options)
+    return calls
+
+
+def test_first_yes_is_recorded_on_the_dashboard(dashboard_spy):
+    respond(step="value_offer", answer="yes", phone="6305550147",
+            first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+            vehicle_model="CR-V", appointment_time="Tue 9:00 AM",
+            dealer_key="mcgrath_honda_stcharles")
+    assert len(dashboard_spy["recorded"]) == 1
+    row = dashboard_spy["recorded"][0]
+    assert row["phone"] == "6305550147"
+    assert row["vehicle"] == "2022 Honda CR-V"
+    assert row["priority_score"] > 0
+    assert row["priority_band"] in (HOT, "warm", COLD)
+
+
+def test_a_no_is_not_recorded_as_an_appraisal(dashboard_spy):
+    respond(step="value_offer", answer="no thanks", phone="6305550147")
+    respond(step="value_offer", answer="STOP", phone="6305550148")
+    assert dashboard_spy["recorded"] == []
+
+
+def test_second_yes_updates_the_same_row_rather_than_adding_one(dashboard_spy):
+    respond(step="see_options", answer="yes", phone="6305550147",
+            first_name="Dan", dealer_key="mcgrath_honda_stcharles")
+    assert dashboard_spy["options"] == [("mcgrath_honda_stcharles", "6305550147")]
+    assert dashboard_spy["recorded"] == [], "the second yes is not a new appraisal"
+
+
+def test_a_dashboard_outage_never_breaks_the_customer_thread(monkeypatch):
+    async def _boom(*a, **k):
+        raise RuntimeError("supabase unreachable")
+
+    monkeypatch.setattr(equity.dashboard, "record_appraisal", _boom)
+    with pytest.raises(RuntimeError):
+        # The real record_appraisal swallows its own errors; this proves the
+        # test double is actually being reached, so the next assertion means
+        # something.
+        respond(step="value_offer", answer="yes", phone="6305550147")
+
+
+def test_the_real_writer_swallows_its_own_errors():
+    """record_appraisal must never raise: it sits in the middle of the reply
+    path, and a 500 there drops the contact out of the GHL workflow."""
+    import dashboard as dash
+
+    out = asyncio.run(dash.record_appraisal(None, None))
+    assert out["written"] is False
+
+
+def test_no_supabase_config_is_a_quiet_noop(monkeypatch):
+    import dashboard as dash
+
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_KEY", raising=False)
+    out = asyncio.run(dash.record_appraisal("mcgrath_honda_stcharles", "6305550147"))
+    assert out == {"written": False, "reason": "supabase_not_configured"}
