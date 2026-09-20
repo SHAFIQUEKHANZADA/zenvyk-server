@@ -570,8 +570,8 @@ def _priority(req) -> dict:
 # The customer-facing copy.
 #
 # Wording rules baked in deliberately:
-#   * "estimated trade value", never "appraisal" — several states regulate who
-#     may call a number an appraisal, and this is an estimate.
+#   * the opening question is the store's own floor script, given by Reid on
+#     21 Sep. See _onsite_message for the note on the word "appraisal".
 #   * no dollar figure — we have no valuation source, and a made-up number in
 #     front of a customer is the one thing we genuinely cannot do.
 #   * opt-out on the first message, because this is a MARKETING text, not the
@@ -625,17 +625,30 @@ def _onsite_message(first_name: Optional[str], model: Optional[str],
     and there was nobody in the lounge to walk over to. Reid's own demo opens
     "While you're in service today" for exactly that reason.
 
-    Says "estimated trade value", never "appraisal" — his demo used the latter,
-    and several states regulate who may call a number an appraisal.
+    The opening question is the store's own script, which Reid gave on 21 Sep:
+    "Have you had an opportunity to get your vehicle professionally appraised?"
+    That is better than the wording this used to carry -- "free estimated trade
+    value" reads like a promotion, "professionally appraised" reads like a
+    service the store performs, and it is what the customer already hears from
+    a person on the floor. Hearing the same sentence from the text and from the
+    advisor is the point.
+
+    Note this drops the deliberate avoidance of the word "appraisal". Several
+    states regulate who may call a number an appraisal, and the earlier copy
+    said "estimated trade value" throughout to stay clear of it. The store uses
+    this language verbally already, so the exposure is unchanged and the wording
+    is theirs to choose -- but if legal ever asks, this is the line and this is
+    why.
     """
     name = (first_name or "").strip()
     who = f"it's {store}. " if store else ""
     hi = f"Hi {name}, " if name else "Hi, "
+    what = (model or "").strip() or "vehicle"
     return _sms_safe(
-        f"{hi}{who}While you're in for service today - used "
+        f"{hi}{who}While you're in for service today - have you had your "
+        f"{what} professionally appraised lately? Used "
         f"{_plural_model(model)} are in short supply and yours may be worth more "
-        f"than you'd expect. Want us to put a free estimated trade value on it "
-        f"while you wait? No obligation either way. Reply STOP to opt out."
+        f"than you'd expect. No obligation. Reply STOP to opt out."
     )
 
 
