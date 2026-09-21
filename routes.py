@@ -541,6 +541,90 @@ def _looks_like_uuid(v: Optional[str]) -> bool:
     return bool(v) and len(v) >= 20 and " " not in v
 
 
+def _spoken_hhmm(pref: str) -> Optional[int]:
+    """Spoken clock time -> minutes past midnight. "5 PM" -> 1020. Returns None when
+    the phrase names no clock time at all ("morning", "whenever")."""
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?", pref)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    ap = (m.group(3) or "").replace(".", "")
+    if ap == "pm" and hh != 12:
+        hh += 12
+    elif ap == "am" and hh == 12:
+        hh = 0
+    elif not ap and 1 <= hh <= 7:      # bare "2" at a dealership almost always means 2 PM
+        hh += 12
+    return hh * 60 + mm
+
+
+# Roughly where each spoken phrase points. Used ONLY to order the fallback list
+# once the preference has already matched nothing -- never to decide what is
+# bookable.
+_PREF_ANCHOR = {"morning": 9 * 60, "noon": 12 * 60, "midday": 12 * 60,
+                "afternoon": 14 * 60, "evening": 17 * 60, "night": 17 * 60}
+
+
+def _boundary_phrase(day_slots: List[str], pref: Optional[str]) -> str:
+    """How to describe the closest openings to a caller whose time we don't have.
+
+    "the latest I have that day is 4:30" is something a caller can act on.
+    Saying that to someone who asked for 8 AM is nonsense, so which end of the
+    day they ran off decides the wording.
+    """
+    if not day_slots:
+        return ""
+    p = (pref or "").lower()
+    mins_of = lambda s: int(s[11:13]) * 60 + int(s[14:16])
+    clock = lambda s: _speak_time(s).split(" at ")[-1]   # "4:30 PM", not the full date
+    target = _spoken_hhmm(p)
+    if target is None:
+        for word, hour in _PREF_ANCHOR.items():
+            if word in p:
+                target = hour
+                break
+    if target is None:
+        return ""
+    if target > mins_of(day_slots[-1]):
+        return f"the latest I have that day is {clock(day_slots[-1])}"
+    if target < mins_of(day_slots[0]):
+        return f"the earliest I have that day is {clock(day_slots[0])}"
+    # They asked for a time inside the day's range that simply isn't open. There
+    # is no boundary to quote -- the offered times speak for themselves.
+    return ""
+
+
+def _nearest_to_pref(slots: List[str], pref: Optional[str], limit: int) -> List[str]:
+    """The `limit` openings CLOSEST to what the caller asked for, chronological.
+
+    This exists because of a loop the stores reported. The caller asks for 5 PM,
+    the last opening is 4:30, and the fallback handed back the first three slots
+    of the day -- 10:00, 10:30, 11:00. The caller says "no, something later", the
+    agent searches again, gets the same three, says unavailable again, and the
+    call goes round until someone hangs up.
+
+    Offering the END of the day instead makes the answer useful even when it is
+    no: "the latest I have is 4:30" is a decision the caller can act on.
+    """
+    if not pref or len(slots) <= limit:
+        return slots[:limit]
+    p = pref.lower()
+    mins_of = lambda s: int(s[11:13]) * 60 + int(s[14:16])
+    target = _spoken_hhmm(p)
+    if target is None:
+        neg = ("not" in p) or ("n't" in p) or ("avoid" in p) or ("except" in p)
+        for word, hour in _PREF_ANCHOR.items():
+            if word in p:
+                # "not the morning" points at the other end of the day, not 9 AM.
+                target = ((mins_of(slots[-1]) if hour < 12 * 60 else mins_of(slots[0]))
+                          if neg else hour)
+                break
+    if target is None:
+        return slots[:limit]
+    return sorted(sorted(slots, key=lambda s: abs(mins_of(s) - target))[:limit])
+
+
 def _filter_by_time_pref(slots: List[str], pref: Optional[str]) -> List[str]:
     """Filter ISO slot strings by the caller's spoken time-of-day preference:
       keywords: 'morning' / 'afternoon' / 'evening' / 'noon'
@@ -567,19 +651,9 @@ def _filter_by_time_pref(slots: List[str], pref: Optional[str]) -> List[str]:
     if "noon" in p or "midday" in p or "mid day" in p or "mid-day" in p:
         return [s for s in slots if 11 <= hh_of(s) <= 13]
 
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?", p)
-    if not m:
+    target = _spoken_hhmm(p)
+    if target is None:
         return slots
-    hh = int(m.group(1))
-    mm = int(m.group(2) or 0)
-    ap = (m.group(3) or "").replace(".", "")
-    if ap == "pm" and hh != 12:
-        hh += 12
-    elif ap == "am" and hh == 12:
-        hh = 0
-    elif not ap and 1 <= hh <= 7:      # bare "2" at a dealership almost always means 2 PM
-        hh += 12
-    target = hh * 60 + mm
 
     if any(w in p for w in ("before", "earlier", "by")):
         return [s for s in slots if mins_of(s) <= target]
@@ -704,6 +778,11 @@ async def get_slots(req: SlotsRequest):
 
     if not slots:
         probe = datetime.strptime(dates[0], "%Y-%m-%d")
+        # First look-ahead day that has ANY openings, kept aside in case the
+        # caller's TIME matches nothing for a fortnight. Without this, "5 PM" on
+        # a fully-booked day walked all 14 probes and told the caller there was
+        # nothing for two weeks -- when every one of those days was open.
+        any_day: Optional[Tuple[List[str], str]] = None
         for _ in range(14):  # up to two weeks out
             probe += timedelta(days=1)
             if is_closed(probe):
@@ -730,10 +809,16 @@ async def get_slots(req: SlotsRequest):
             except mk.MyKaarmaError:
                 continue
             found = _drop_after_cutoff(found, req.dealer_key)
+            if found and any_day is None:
+                any_day = (list(found), nxt)
             found = _filter_by_time_pref(found, req.time)
             if found:
                 slots, dates, searched_ahead = found, [nxt], True
                 break
+        else:
+            if any_day:
+                slots, dates = any_day[0], [any_day[1]]
+                searched_ahead, time_pref_missed = True, bool(req.time)
 
     if not slots:
         return {
@@ -747,10 +832,29 @@ async def get_slots(req: SlotsRequest):
             ),
         }
 
-    top = slots[:MAX_SLOTS]
+    # When the caller's time missed, hand back the openings nearest what they
+    # asked for. slots[:MAX_SLOTS] would give the first three of the day, which
+    # is how a 5 PM request ended up being offered 10 AM.
+    top = (_nearest_to_pref(slots, req.time, MAX_SLOTS) if time_pref_missed
+           else slots[:MAX_SLOTS])
     spoken_day = datetime.strptime(dates[0], "%Y-%m-%d").strftime("%A, %B %d").replace(" 0", " ")
 
-    if searched_ahead:
+    _boundary = _boundary_phrase(slots, req.time) if time_pref_missed else ""
+
+    no_repeat = (
+        " Searching this day again for a different time returns this SAME list,"
+        " so do NOT call get_slots again for another time on this day. If none of"
+        " these work, ask what OTHER DAY suits them and search that day instead."
+    )
+
+    if searched_ahead and time_pref_missed:
+        instruction = (
+            f"The day the customer asked for has no openings, and the TIME they asked "
+            f"for isn't open on {spoken_day} either. Tell them both plainly, then offer "
+            f"ONLY the times in 'spoken_slots' — these are the closest we have to what "
+            f"they wanted. Do NOT invent a time and do NOT transfer." + no_repeat
+        )
+    elif searched_ahead:
         instruction = (
             f"The day the customer asked for has no more available times (fully booked, "
             f"or it's already too late in the day). The next day with openings is "
@@ -763,9 +867,13 @@ async def get_slots(req: SlotsRequest):
         instruction = (
             f"The time the customer asked for is NOT available on {spoken_day}. Say "
             f"so plainly first — \"I don't have anything then\" — then offer ONLY the "
-            f"times in 'spoken_slots'. Do NOT agree to the time they asked for and do "
-            f"NOT invent another one. Once they choose, call book_appointment with the "
-            f"exact matching value from 'slots'."
+            f"times in 'spoken_slots'. These are the openings CLOSEST to what they "
+            f"asked for. Do NOT agree to the "
+            f"time they asked for and do NOT invent another one. Once they choose, "
+            f"call book_appointment with the exact matching value from 'slots'."
+            + (f" Give them the real boundary in your own words: "
+               f"\"{_boundary}\"." if _boundary else "")
+            + no_repeat
         )
     else:
         instruction = (
