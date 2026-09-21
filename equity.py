@@ -22,9 +22,9 @@ market value minus payoff:
     market value  -> vAuto / KBB / Black Book / MMR. No API access confirmed.
 
 We have neither, so this build never states a number. The customer is told a
-number will be ready when they arrive, and the salesperson gives it in person.
-That is also the safer wording — several states regulate who may call something
-an "appraisal", so the copy here says "estimated trade value" throughout.
+number is never stated in a text. The appraisal happens in person, which is
+also what Reid's floor script promises: "someone take a quick look while you're
+already here."
 
 When a valuation feed appears, the only thing that changes is that
 `_onsite_message()` gains a figure. Nothing else in this file moves.
@@ -601,21 +601,7 @@ def _sms_safe(text: Optional[str]) -> Optional[str]:
     return text
 
 
-def _plural_model(model: Optional[str]) -> str:
-    """
-    'CR-V' -> 'CR-Vs'. The text reads as a person wrote it, so it names the
-    MODEL, not the whole '2022 Honda CR-V' label — saying the full label twice
-    in two sentences is the tell that a machine sent it.
-    """
-    m = (model or "").strip()
-    if not m:
-        return "vehicles like yours"
-    if m.lower().endswith(("s", "x", "z", "ch", "sh")):
-        return f"{m}s"  # Lexus -> Lexuss reads wrong, but no McGrath brand hits this
-    return f"{m}s"
-
-
-def _onsite_message(first_name: Optional[str], model: Optional[str],
+def _onsite_message(first_name: Optional[str],
                     store: Optional[str] = None) -> str:
     """
     The opening text, sent WHILE the customer is at the dealership.
@@ -625,42 +611,68 @@ def _onsite_message(first_name: Optional[str], model: Optional[str],
     and there was nobody in the lounge to walk over to. Reid's own demo opens
     "While you're in service today" for exactly that reason.
 
-    The opening question is the store's own script, which Reid gave on 21 Sep:
-    "Have you had an opportunity to get your vehicle professionally appraised?"
-    That is better than the wording this used to carry -- "free estimated trade
-    value" reads like a promotion, "professionally appraised" reads like a
-    service the store performs, and it is what the customer already hears from
-    a person on the floor. Hearing the same sentence from the text and from the
-    advisor is the point.
+    This is the store's own floor script, which Reid wrote out on 21 Sep. Every
+    part of it is deliberate and it should not be "improved":
 
-    Note this drops the deliberate avoidance of the word "appraisal". Several
-    states regulate who may call a number an appraisal, and the earlier copy
-    said "estimated trade value" throughout to stay clear of it. The store uses
-    this language verbally already, so the exposure is unchanged and the wording
-    is theirs to choose -- but if legal ever asks, this is the line and this is
-    why.
+        "have you had a chance to..."  assumes nothing and asks for no
+            decision. The customer is being asked whether something has
+            HAPPENED, not whether they want to buy, sell or trade. Nothing to
+            resist.
+
+        "your vehicle", not "your CR-V"  reads conversational. Naming the exact
+            model in the opening line is the tell that a machine sent it.
+            Personalisation belongs in the second message, once they've engaged.
+
+        "professionally"  raises the perceived worth of the thing being
+            offered. Not a Kelley Blue Book lookup — a real appraisal against
+            condition, mileage and the current market.
+
+        "appraised", never "trade"  appraised is informational, trade is
+            transactional. The moment someone reads "trade", they are thinking
+            about payments, salespeople and negotiation, and resistance goes up.
+
+    What is deliberately NOT here: "used CR-Vs are in short supply". That is
+    advertising, and Reid was explicit that it must not lead. It moved to the
+    second message, where it becomes the REASON for a question the customer has
+    already answered. Question -> curiosity -> reason -> value -> next step, in
+    that order. The first text is not trying to sell a car. It is trying to
+    earn a reply.
+
+    Note this drops the old deliberate avoidance of the word "appraisal".
+    Several states regulate who may call a number an appraisal, and the earlier
+    copy said "estimated trade value" throughout to stay clear of it. The store
+    uses this language verbally already, so the exposure is unchanged and the
+    wording is theirs to choose -- but if legal ever asks, this is the line and
+    this is why.
+
+    The STOP notice is not in Reid's script and is not optional: this is a
+    marketing text riding behind a transactional appointment.
     """
     name = (first_name or "").strip()
     who = f"it's {store}. " if store else ""
     hi = f"Hi {name}, " if name else "Hi, "
-    what = (model or "").strip() or "vehicle"
     return _sms_safe(
-        f"{hi}{who}While you're in for service today - have you had your "
-        f"{what} professionally appraised lately? Used "
-        f"{_plural_model(model)} are in short supply and yours may be worth more "
-        f"than you'd expect. No obligation. Reply STOP to opt out."
+        f"{hi}{who}Quick question - have you had a chance to get your vehicle "
+        f"professionally appraised lately? Reply STOP to opt out."
     )
 
 
+# Reid's second beat, verbatim. Only sent once the customer has replied, which
+# is why it can afford to make the pitch the opening text deliberately withheld:
+# the reason we asked, the value, then an easy next step. "Vehicles like yours"
+# rather than the model, for the same reason the opener says "your vehicle".
 SEE_OPTIONS_MESSAGE = (
-    "Great - we'll get that number put together for you now. While you're "
-    "waiting, would you like to see what your options look like? No pressure, "
-    "just a look."
+    "The reason I ask is that we're actively looking for vehicles like yours, "
+    "and it may be worth more than you realize. We can have someone take a "
+    "quick look while you're already here."
 )
 
+# No longer "with your numbers": under Reid's script nothing has been valued
+# yet, the appraisal happens in person. Promising numbers that don't exist is
+# how a customer who said yes ends up disappointed by the person walking over.
 CONFIRM_MESSAGE = (
-    "Perfect. Someone from our sales team will come find you in the lounge with "
-    "your numbers. See you soon!"
+    "Perfect. Someone from our team will come find you in the lounge to take a "
+    "look. See you soon!"
 )
 
 DECLINE_MESSAGE = (
@@ -809,10 +821,10 @@ async def _fill_from_mykaarma(req) -> str:
 
         if not label and c["vehicles"]:
             label = c["vehicles"][0]["label"]
-            # Split it out, not just the year. The text names the MODEL
-            # ("Used CR-Vs are in short supply"), so without this every
-            # myKaarma-sourced customer gets the generic "vehicles like
-            # yours" wording instead.
+            # Split it out, not just the year. The customer copy no longer
+            # names the model -- Reid's script says "your vehicle" on purpose
+            # -- but the year drives the age exclusion and the priority score,
+            # and the salesperson's alert card is worthless without the car.
             y, make, model = _split_label(label)
             req.vehicle_year = str(y or "")
             req.vehicle_make = req.vehicle_make or make
@@ -888,7 +900,7 @@ async def equity_screen(req: ScreenRequest):
 
     pri = _priority(req)
     store = (DEALERS.get(req.dealer_key or DEFAULT_DEALER_KEY) or {}).get("name")
-    message = _onsite_message(req.first_name, req.vehicle_model, store)
+    message = _onsite_message(req.first_name, store)
 
     # Hand it straight to GHL — see the PUSHING BACK INTO GHL note above for why
     # the workflow can't just read this response and branch on it.
