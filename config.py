@@ -37,7 +37,6 @@ DEFAULT_APPOINTMENT_MINUTES = int(os.getenv("DEFAULT_APPOINTMENT_MINUTES", "60")
 # Shafique, I found your profile" while the caller was still saying "yes" to the
 # number she had just read back — so she got cut off mid-greeting. Holding the
 # response to a floor leaves room for the caller to finish their turn.
-LOOKUP_MIN_SECONDS = float(os.getenv("LOOKUP_MIN_SECONDS", "3"))
 
 DEFAULT_DEALER_KEY = os.getenv("DEFAULT_DEALER_KEY", "mcgrath_honda_stcharles")
 

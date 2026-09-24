@@ -24,7 +24,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 import mykaarma_client as mk
-from config import DEALERS, MAX_SLOTS, LOOKUP_MIN_SECONDS, get_dealer, DealerNotConfigured
+from config import DEALERS, MAX_SLOTS, get_dealer, DealerNotConfigured
 
 log = logging.getLogger("mykaarma.routes")
 router = APIRouter(prefix="/mykaarma", tags=["myKaarma"])
@@ -424,24 +424,6 @@ def _fail(message: str, error: str = "error", **extra):
 # ─────────────────────────────────────────────────────────────
 @router.post("/lookup-customer")
 async def lookup_customer(req: LookupRequest):
-    """Hold the answer to LOOKUP_MIN_SECONDS before returning it.
-
-    The realtime voice model speaks the moment this returns, and myKaarma usually
-    answers in well under a second — so Esther started "Hi Shafique, I found your
-    profile" while the caller was still saying "yes" to the number she had read
-    back, and was cut off mid-greeting. The floor is on the RESPONSE, not the
-    search: the lookup still runs immediately, we just don't hand it back early,
-    so a slow lookup adds nothing on top.
-    """
-    started = time.monotonic()
-    result = await _lookup_customer_impl(req)
-    remaining = LOOKUP_MIN_SECONDS - (time.monotonic() - started)
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-    return result
-
-
-async def _lookup_customer_impl(req: LookupRequest):
     _REQUEST_DEALER.set(req.dealer_key)
     try:
         dealer = get_dealer(req.dealer_key)
