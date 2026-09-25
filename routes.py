@@ -1169,15 +1169,25 @@ async def book_appointment(req: BookRequest):
         try:
             if is_reschedule:
                 # Move the ONE existing appointment in place — no duplicate.
+                # NEVER send service_op or a rebuilt note on an UPDATE.
+                # Measured against live myKaarma 2026-09-25: a PATCH carrying
+                # serviceList comes back 200 with no warning and leaves the
+                # appointment with an EMPTY service list — the opcode set at
+                # creation is destroyed. A PATCH with only the start time keeps
+                # it. The same applies to comments: _build_appointment_note
+                # always produces text, so passing it overwrote the advisor's
+                # original concern note ("Customer concern: brake noise") with a
+                # generic "Service requested: oil change" every time a caller
+                # moved their appointment. A reschedule changes the TIME. Only
+                # send what the caller actually changed.
                 result = await mk.update_appointment(
                     dealer,
                     reschedule_uuid,
                     start=wanted,
                     vehicle_uuid=vehicle_uuid,
                     vin=req.vin,
-                    service_op=op,
                     transport_option=transport_uuid,
-                    comments=note,
+                    comments=note if req.comments else None,
                 )
             else:
                 result = await mk.create_appointment(

@@ -855,12 +855,22 @@ async def get_customer_appointments(
 def parse_appointment(appt: dict) -> dict:
     """Flatten one appointment into the shape the voice agent speaks."""
     veh = appt.get("vehicleInformation") or {}
-    label = " ".join(
-        str(veh.get(k)).strip()
-        for k in ("year", "brand", "model")
-        if veh.get(k) and str(veh.get(k)).strip()
-        and str(veh.get(k)).strip().lower() not in VEHICLE_JUNK
-    ).strip()
+
+    def _part(k: str) -> str:
+        v = str(veh.get(k) or "").strip()
+        return "" if v.lower() in VEHICLE_JUNK else v
+
+    year, brand, model = _part("year"), _part("brand"), _part("model")
+    # A YEAR ON ITS OWN IS NOT A VEHICLE. When an appointment books with no
+    # vehicle attached, myKaarma still returns a stub carrying only the current
+    # year — so this produced the label "2026", and lookup_customer read it
+    # straight into the agent's instruction ("an upcoming appointment for the
+    # 2026"). Esther then told callers about "your 2026". Require a make or
+    # model before we call it a vehicle.
+    label = (
+        " ".join(p for p in (year, brand, model) if p).strip()
+        if (brand or model) else ""
+    )
     services = [
         (s.get("description") or "").strip()
         for s in (appt.get("serviceList") or [])
