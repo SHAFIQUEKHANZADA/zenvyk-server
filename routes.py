@@ -187,39 +187,51 @@ def _advisor_cutoff(dealer_key: Optional[str], day: str) -> Optional[str]:
     return _NO_ADVISOR_FROM.get((dealer_key or "", weekday))
 
 
-# ── SLOTS THIS CALLER HAS ALREADY BEEN REFUSED ──────────────────────────────
-# myKaarma's availability API and its booking API disagree: get-slots offers a
-# time, create/update then answers SLOT_UNAVAILABLE. When that happened we
-# re-queried the SAME day and handed back the SAME list, so the agent offered a
-# slot it had just been refused. Measured live 2026-09-25 at St. Charles: a
-# caller cycled 9:30 -> 10:00 -> 8:30 -> 10:00, every one rejected, with no way
-# out of the loop. Remember what this caller has already been refused on this
-# call and never offer it to them again.
+# ── EXACT TIMES A STORE HAS JUST REFUSED ──────────────────────────
+# myKaarma's availability API and its booking API disagree: get_slots offers a
+# time, then create/update answers SLOT_UNAVAILABLE for that very time.
 #
-# Deliberately in memory and per CALLER (not per store): the refusals are about
-# this one appointment being moved, not about the store's schedule, so they must
-# not leak to the next caller. A redeploy simply forgets them.
-_REJECTED_SLOTS: Dict[Tuple[str, str], Tuple[set, float]] = {}
-_REJECTED_TTL_SECONDS = 3600.0
+# Measured live 2026-09-25 at Honda St. Charles. A caller asked to move her
+# appointment to Monday evening, was offered 4:00 PM, was refused it, was shown
+# the morning instead, said again that she wanted an evening — and get_slots
+# handed back 4:00 PM, because nothing told it the booking had just been turned
+# down. She was refused 4:00 PM three times in two minutes, then the call did
+# the same thing on Tuesday, and she hung up without an appointment.
+#
+# So remember the exact slot and stop offering it.
+#
+# PER STORE, not per caller: if 4:00 PM Monday will not take a booking it will
+# not take one from the next caller either, and they must not walk into the
+# same wall.
+#
+# Keyed on the exact date+time with a SHORT ttl, deliberately NOT as an hour
+# cutoff. Probed the same store with an empty schedule and 4:00 PM and 4:30 PM
+# both booked without complaint, so the hour is fine — that afternoon was
+# simply full. Real capacity moves: a cancellation reopens the time, so we must
+# not blacklist an hour the store genuinely sells.
+_REFUSED_SLOTS: Dict[Tuple[str, str], float] = {}
+_REFUSED_SLOT_TTL = 1800.0   # 30 minutes
 
 
-def _reject_key(req: "BookRequest", customer_uuid: Optional[str]) -> Tuple[str, str]:
-    return (req.dealer_key or "", customer_uuid or req.phone or "")
-
-
-def _remember_rejected(key: Tuple[str, str], iso: str) -> None:
+def _remember_refused(dealer_key: Optional[str], iso: str) -> None:
     now = time.monotonic()
-    for k, (_slots, touched) in list(_REJECTED_SLOTS.items()):
-        if now - touched > _REJECTED_TTL_SECONDS:
-            _REJECTED_SLOTS.pop(k, None)
-    slots, _ = _REJECTED_SLOTS.get(key, (set(), now))
-    slots.add(iso)
-    _REJECTED_SLOTS[key] = (slots, now)
+    for k, seen in list(_REFUSED_SLOTS.items()):
+        if now - seen > _REFUSED_SLOT_TTL:
+            _REFUSED_SLOTS.pop(k, None)
+    _REFUSED_SLOTS[(dealer_key or "", iso)] = now
+    log.info("%s refused %s — not offering it again for 30 min", dealer_key, iso)
 
 
-def _rejected_slots(key: Tuple[str, str]) -> set:
-    entry = _REJECTED_SLOTS.get(key)
-    return entry[0] if entry else set()
+def _drop_refused(slots: List[str], dealer_key: Optional[str]) -> List[str]:
+    """Remove times this store refused a booking for in the last half hour."""
+    now = time.monotonic()
+    kept = []
+    for s in slots:
+        seen = _REFUSED_SLOTS.get((dealer_key or "", s))
+        if seen is not None and now - seen <= _REFUSED_SLOT_TTL:
+            continue
+        kept.append(s)
+    return kept
 
 
 def _remember_no_advisor(dealer_key: Optional[str], iso: str) -> None:
@@ -791,6 +803,7 @@ async def get_slots(req: SlotsRequest):
     earliest = now_local + timedelta(minutes=SLOT_LEAD_MINUTES)
     slots = [s for s in slots if datetime.fromisoformat(s) > earliest]
     slots = _drop_after_cutoff(slots, req.dealer_key)
+    slots = _drop_refused(slots, req.dealer_key)
 
     # Honour the caller's time-of-day preference ("12 PM", "after 2", "evening"…).
     # Keep the day's raw openings so we can fall back if the preference matches nothing.
@@ -845,6 +858,7 @@ async def get_slots(req: SlotsRequest):
             except mk.MyKaarmaError:
                 continue
             found = _drop_after_cutoff(found, req.dealer_key)
+            found = _drop_refused(found, req.dealer_key)
             if found and any_day is None:
                 any_day = (list(found), nxt)
             found = _filter_by_time_pref(found, req.time)
@@ -954,9 +968,7 @@ async def _slot_taken(
     opening at all (nobody is on the service drive then), rather than a slot someone
     else grabbed first. Same recovery, but we must not tell the caller it "was taken"."""
     spoken_wanted = _speak_datetime(wanted)
-    key = _reject_key(req, customer_uuid)
-    _remember_rejected(key, wanted)
-    refused = _rejected_slots(key)
+    _remember_refused(req.dealer_key, wanted)
     slots: List[str] = []
     spoken: List[str] = []
     try:
@@ -969,7 +981,8 @@ async def _slot_taken(
             dealer_key=req.dealer_key,
         ))
         for raw, say in zip(alt.get("slots") or [], alt.get("spoken_slots") or []):
-            if raw not in refused:
+            # get_slots already drops anything this store just refused.
+            if raw != wanted:
                 slots.append(raw)
                 spoken.append(say)
     except Exception as e:  # never let the fallback lookup break the response
