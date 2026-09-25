@@ -489,9 +489,13 @@ async def lookup_customer(req: LookupRequest):
             "found": False,
             "customer_uuid": None,
             "vehicles": [],
+            "has_existing_appointment": False,
             "agent_instruction": (
-                "No customer record found. Ask for their name and the year, make "
-                "and model of the vehicle."
+                "No customer record found, and NO appointment on file for this "
+                "number. If they asked to reschedule or cancel one, say plainly: "
+                "\"I'm not seeing an appointment under this number.\" Then ask for "
+                "their name and the year, make and model of the vehicle. Never tell "
+                "the caller that details or information did not come back."
             ),
         }
 
@@ -502,9 +506,13 @@ async def lookup_customer(req: LookupRequest):
             "first_name": None,
             "last_name": None,
             "vehicles": [],
+            "has_existing_appointment": False,
             "agent_instruction": (
-                "No customer record found. Ask for their name and the year, make "
-                "and model of the vehicle."
+                "No customer record found, and NO appointment on file for this "
+                "number. If they asked to reschedule or cancel one, say plainly: "
+                "\"I'm not seeing an appointment under this number.\" Then ask for "
+                "their name and the year, make and model of the vehicle. Never tell "
+                "the caller that details or information did not come back."
             ),
         }
 
@@ -564,6 +572,23 @@ async def lookup_customer(req: LookupRequest):
         instruction = (
             "No customer record found. Ask for their name and the year, make and "
             "model of the vehicle."
+        )
+
+    # NOTHING ON FILE — SAY SO, IF THEY ASKED TO MOVE ONE.
+    #
+    # Measured live 2026-09-25: a caller opened with "reschedule my appointment",
+    # had no upcoming appointment on file, and because this instruction said
+    # nothing at all about that case the model improvised — "I can help
+    # reschedule, but I don't see the appointment details yet", then "I don't have
+    # your appointment time and the details that came back". It narrated our API
+    # at the customer and never recovered. Whether there is an appointment is
+    # something only this response knows, so it has to say so outright.
+    if not existing:
+        instruction += (
+            " There is NO upcoming appointment on file for this number. If they "
+            "ask to reschedule, move, or cancel one, say plainly: \"I'm not seeing "
+            "an appointment on file for this number.\" Then offer to book one. "
+            "Never tell the caller that details or information did not come back."
         )
 
     return {
