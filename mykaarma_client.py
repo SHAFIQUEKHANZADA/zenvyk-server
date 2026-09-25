@@ -292,7 +292,15 @@ def parse_search_match(match: dict) -> dict:
                 "vin": v.get("vin"),
             }
         )
-    vehicles = vehicles[:MAX_VEHICLES]
+    # DELIBERATELY NOT TRUNCATED HERE.
+    #
+    # MAX_VEHICLES exists so Esther doesn't read a long list of cars down the
+    # phone — it is a SPEAKING limit. Applying it here also hid vehicles from
+    # booking, which uses this same function to find the car the caller named.
+    # Measured live 2026-09-26: a caller said "2018 Honda Accord", the Accord was
+    # on their record, but it sorted fourth of six and fell outside the cap, so
+    # the match failed and the appointment reached the drive as "Vehicle TBD".
+    # lookup_customer applies the cap itself, where the vehicles are spoken.
     return {
         "customer_uuid": match.get("uuid"),
         "first_name": (match.get("fname") or "").strip() or None,

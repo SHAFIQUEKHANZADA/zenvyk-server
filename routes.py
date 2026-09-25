@@ -517,6 +517,9 @@ async def lookup_customer(req: LookupRequest):
         }
 
     c = mk.parse_search_match(matches[0])
+    # Cap the list HERE, where it gets spoken and handed to the agent. Booking
+    # needs the full list to find the car the caller named.
+    c["vehicles"] = c["vehicles"][:mk.MAX_VEHICLES]
     found = bool(c["customer_uuid"] and (c["first_name"] or c["vehicles"]))
 
     # Does this caller already have an upcoming appointment? If so, the agent
