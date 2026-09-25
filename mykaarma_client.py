@@ -308,8 +308,27 @@ def parse_customer(data: dict) -> dict:
 
     vehicles: List[dict] = []
     for v in customer.get("vehicles") or []:
+        make = (v.get("make") or "").strip()
+        model = (v.get("model") or "").strip()
+
+        # SKIP myKaarma's "No Vehicle Selected" PLACEHOLDER.
+        #
+        # parse_search_match has always dropped these; this function did not, and
+        # it is the one booking reads after saving a customer. Measured live
+        # 2026-09-25 at Honda St. Charles: a caller booked an oil change on her
+        # 2022 Honda CR-V, the record held both the real CR-V and the placeholder
+        # (year 2026, make "Other", model "No Vehicle Selected"), the placeholder
+        # came back first, and the appointment attached to THAT — it showed on
+        # the drive as "Vehicle TBD". Worse, because a vehicle had been picked,
+        # booking skipped the step that matches the car the caller actually named.
+        # A placeholder is not a vehicle.
+        if any(j in f"{make} {model}".lower() for j in VEHICLE_JUNK):
+            continue
+        if not make and not model:
+            continue
+
         label = " ".join(
-            str(x) for x in (v.get("year"), v.get("make"), v.get("model")) if x
+            str(x) for x in (v.get("year"), make, model) if x
         ).strip()
         vehicles.append(
             {
