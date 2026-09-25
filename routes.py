@@ -1001,6 +1001,7 @@ async def book_appointment(req: BookRequest):
     # look up their real upcoming appointment and update THAT. The agent's value is
     # only a fallback if we can't resolve one ourselves.
     reschedule_uuid = None
+    _existing = None      # stays None if we never got to look the appointments up
     check_uuid = customer_uuid
     if not check_uuid and req.phone:
         try:
@@ -1023,9 +1024,35 @@ async def book_appointment(req: BookRequest):
                 )
         except mk.MyKaarmaError as e:
             log.warning("reschedule lookup failed: %s", e)
-    # fallback: trust the agent's UUID only if we couldn't find one ourselves
+    # The agent's UUID is a LAST RESORT and is only usable if it is genuinely one
+    # of THIS customer's upcoming appointments.
+    #
+    # Measured live 2026-09-25: the voice model sent get_slots' `operation_uuid`
+    # (the OPCODE — 7de0x0Jm80MgtO0dvxoeIc2P_Ye9DqLAfg96U9x5aWY) as
+    # reschedule_appointment_uuid. Every myKaarma uuid is the same 43-char shape,
+    # so nothing caught it, and we PATCHed an opcode as though it were an
+    # appointment -> INCORRECT_APPOINTMENT, "No appointment found for given
+    # appointment uuid". The caller was told the booking failed.
+    #
+    # If we resolved the customer's appointments above, the agent's value must
+    # appear in that list. If it doesn't, it is not an appointment — drop it and
+    # book fresh rather than PATCHing something arbitrary.
+    # _existing is None only when we never managed to look (no customer resolved,
+    # or myKaarma errored). An EMPTY list is a real answer: this customer has no
+    # upcoming appointment, so whatever the agent sent cannot be one.
     if not reschedule_uuid and req.reschedule_appointment_uuid:
-        reschedule_uuid = req.reschedule_appointment_uuid
+        if _existing is None:
+            reschedule_uuid = req.reschedule_appointment_uuid
+        elif req.reschedule_appointment_uuid in {
+            a["appointment_uuid"] for a in _existing
+        }:
+            reschedule_uuid = req.reschedule_appointment_uuid
+        else:
+            log.warning(
+                "ignoring agent reschedule_appointment_uuid %s — not an upcoming "
+                "appointment on customer %s; booking fresh instead",
+                req.reschedule_appointment_uuid, check_uuid,
+            )
 
     # 1. ALWAYS save the customer with the full details we collected on the call.
     #    Earlier this only ran when no customer_uuid was passed — but lookup_customer
@@ -1218,6 +1245,12 @@ async def book_appointment(req: BookRequest):
                 "SLOT_UNAVAILABLE" in body
                 or "NO_TIME_INTERVAL" in body
                 or "NO_SA_AVAILABLE" in body
+                # "Appointment request violates capacity planning constraints" —
+                # the shop is booked out for that time. Measured live 2026-09-25:
+                # this fell through to the generic failure below, so a caller who
+                # picked a full slot was told the appointment "could not be booked"
+                # and offered nothing. It means exactly what a taken slot means.
+                or "CAPACITY_PLANNING" in body
             ):
                 no_sa = "NO_SA_AVAILABLE" in body
                 if no_sa:
