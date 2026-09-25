@@ -1045,6 +1045,108 @@ async def _slot_taken(
     }
 
 
+def _squash(text: str) -> str:
+    """Lowercase and strip everything that isn't a letter or a digit.
+
+    myKaarma writes the model as "CR-V" while the voice model hands us "CRV" or
+    "CR V", so a literal comparison said the caller's own car was not on file.
+    Squashing both sides makes all three the same string."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _vehicle_matches(label: str, year, make, model) -> bool:
+    """Is `label` the car the caller described?
+
+    Every part the caller named has to appear. A caller who said "2024 Acura MDX"
+    must NOT match a 2023 Honda Pilot — booking someone onto the wrong car is
+    worse than booking them onto none."""
+    hay = _squash(label)
+    parts = [_squash(str(x)) for x in (year, make, model) if x]
+    return bool(parts) and all(part and part in hay for part in parts)
+
+
+# asyncio only keeps a WEAK reference to a running task, so a fire-and-forget
+# create_task() can be garbage-collected before it finishes. Hold the reference
+# until it is done.
+_BACKGROUND_TASKS: set = set()
+
+
+async def _attach_stated_vehicle(
+    dealer: Dict[str, str],
+    appointment_uuid: str,
+    customer_uuid: str,
+    phone: Optional[str],
+    first_name: Optional[str],
+    last_name: Optional[str],
+    year: Optional[str],
+    make: Optional[str],
+    model: Optional[str],
+) -> None:
+    """Put the car the caller named ON the customer, then ON the appointment.
+
+    A caller who says "no, it's my 2018 Honda Accord" has told us what they are
+    bringing in. Until now we refused to attach anything that wasn't already on
+    file and wrote it into the notes instead, so the appointment reached the
+    drive as "Vehicle TBD" — which is exactly what the store complained about.
+
+    Measured live 2026-09-26 at Honda St. Charles:
+      * save_customer with the phone MATCHES the existing record and adds the
+        vehicle to it — it does not create a second customer.
+      * the new vehicle takes about 8 seconds to become searchable.
+      * sending year/make/model on the appointment itself is IGNORED: myKaarma
+        substitutes its "No Vehicle Selected" placeholder.
+      * attaching it afterwards with a vehicle-only PATCH works and leaves the
+        service list intact.
+
+    That 8 seconds is why this runs AFTER we have answered. Adding it to the
+    booking call would have left the caller listening to silence on top of the
+    time the booking already takes. If any of it fails the appointment still
+    stands and the note still names the car, so the advisor is no worse off."""
+    try:
+        await mk.save_customer(
+            dealer,
+            phone=phone,
+            first_name=first_name,
+            last_name=last_name,
+            vehicle_year=year,
+            vehicle_make=make,
+            vehicle_model=model,
+        )
+    except mk.MyKaarmaError as e:
+        log.warning("could not save stated vehicle for %s: %s", customer_uuid, e)
+        return
+
+    # Poll until myKaarma indexes it. ~8s measured; allow generous headroom.
+    for _ in range(12):
+        await asyncio.sleep(2)
+        try:
+            matches = await mk.search_customer(dealer, phone=phone)
+        except mk.MyKaarmaError:
+            continue
+        for m in matches:
+            # ONLY a vehicle on the customer we actually booked under. myKaarma
+            # rejects a uuid from any other record with VEHICLE_UUID_NOT_FOUND.
+            if m.get("uuid") != customer_uuid:
+                continue
+            for v in mk.parse_search_match(m)["vehicles"]:
+                if not _vehicle_matches(v.get("label"), year, make, model):
+                    continue
+                try:
+                    await mk.update_appointment(
+                        dealer, appointment_uuid, vehicle_uuid=v["vehicle_uuid"]
+                    )
+                    log.info(
+                        "attached %s to appointment %s", v.get("label"), appointment_uuid
+                    )
+                except mk.MyKaarmaError as e:
+                    log.warning("could not attach %s: %s", v.get("label"), e)
+                return
+    log.warning(
+        "stated vehicle %s %s %s never became searchable for %s",
+        year, make, model, customer_uuid,
+    )
+
+
 @router.post("/book-appointment")
 async def book_appointment(req: BookRequest):
     _REQUEST_DEALER.set(req.dealer_key)
@@ -1234,8 +1336,10 @@ async def book_appointment(req: BookRequest):
                 ]
                 # prefer the vehicle matching what the caller told us
                 for v in real:
-                    label = (v.get("label") or "").lower()
-                    if want and all(w in label for w in want.split() if w):
+                    if want and _vehicle_matches(
+                        v.get("label"), req.vehicle_year, req.vehicle_make,
+                        req.vehicle_model,
+                    ):
                         vehicle_uuid = v["vehicle_uuid"]
                         break
                 # Fall back to the first vehicle on file ONLY when the caller never
@@ -1415,6 +1519,25 @@ async def book_appointment(req: BookRequest):
                 "reschedule_uuid": reschedule_uuid,
             },
         )
+
+    # THE CAR THE CALLER NAMED GOES ON THE APPOINTMENT, ON FILE OR NOT.
+    #
+    # If we could not attach a vehicle, but the caller told us exactly what they
+    # are bringing in, add it to their record and attach it. This runs in the
+    # background because the new vehicle takes ~8 seconds to become searchable in
+    # myKaarma, and the caller is on the phone — see _attach_stated_vehicle.
+    if not vehicle_uuid and stated_vehicle and customer_uuid and req.phone:
+        _appt_uuid = reschedule_uuid or (result or {}).get("appointmentUuid")
+        if _appt_uuid:
+            _task = asyncio.create_task(_attach_stated_vehicle(
+                dealer, _appt_uuid, customer_uuid, req.phone,
+                req.first_name, req.last_name,
+                req.vehicle_year, req.vehicle_make, req.vehicle_model,
+            ))
+            _BACKGROUND_TASKS.add(_task)
+            _task.add_done_callback(_BACKGROUND_TASKS.discard)
+        else:
+            log.warning("no appointment uuid returned; cannot attach %s", stated_vehicle)
 
     spoken = _speak_datetime(booked_time)
     verb = "rescheduled to" if is_reschedule else "booked for"
