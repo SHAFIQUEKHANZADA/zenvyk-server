@@ -1289,7 +1289,10 @@ async def book_appointment(req: BookRequest):
     # the agent can ask the caller instead of deciding for them.
     wanted = next(candidate_times(start, count=1))
 
-    for _attempt in range(2):  # a 2nd pass only ever runs to drop a bad vehicle_uuid
+    # Extra passes only ever run to DROP something myKaarma refused — a bad
+    # vehicle_uuid, or a transport option the store has no advisor for.
+    dropped_transport = None
+    for _attempt in range(3):
         try:
             if is_reschedule:
                 # Move the ONE existing appointment in place — no duplicate.
@@ -1337,6 +1340,34 @@ async def book_appointment(req: BookRequest):
                 # attached than no booking at all. Same time, one more try.
                 log.warning("vehicle %s rejected; retrying without it", vehicle_uuid)
                 vehicle_uuid = None
+                continue
+            # NO ADVISOR FOR THE TRANSPORT THE CALLER ASKED FOR.
+            #
+            # Measured live 2026-09-25 at Honda St. Charles: a LOANER appointment
+            # is refused NO_SA_AVAILABLE at every time of day — 9 AM, 1 PM,
+            # 3 PM, 4 PM — while the very same slot books instantly with
+            # shuttle, will-wait, or no transport at all. The store lists Loaner
+            # as a transport option but has no advisor configured to take one,
+            # and the availability API knows nothing about it: it returns an
+            # identical open grid whether or not the loaner is selected.
+            #
+            # So a caller who wanted a loaner was walked around the schedule being
+            # refused every time she picked, because each refusal looked to us like
+            # a busy slot. It never was — no time of day would ever have worked.
+            #
+            # Book it WITHOUT the structured transport field. The note already
+            # carries "Transport: loaner", so the advisor still sees the request
+            # and can sort the car out. An appointment with a loaner request on it
+            # beats no appointment at all — but we must NOT let the agent tell
+            # the caller the loaner is confirmed, so we flag it below.
+            if "NO_SA_AVAILABLE" in body and transport_uuid:
+                log.warning(
+                    "%s refuses %s with transport %r — rebooking without the "
+                    "structured transport option; the note still carries it",
+                    req.dealer_key, wanted, req.transport,
+                )
+                dropped_transport = req.transport
+                transport_uuid = None
                 continue
             if (
                 "SLOT_UNAVAILABLE" in body
@@ -1402,11 +1433,19 @@ async def book_appointment(req: BookRequest):
         "customer_uuid": customer_uuid,
         "vehicle_uuid": vehicle_uuid,
         "rescheduled": is_reschedule,
+        "transport_confirmed": not dropped_transport,
         "agent_instruction": (
             f"The appointment is {verb} {spoken}. Tell the customer: "
             f"'You're all set for {spoken}.' If that's different from what they asked, "
             "briefly mention it was the closest opening. Then let them know a "
             "confirmation is on the way."
+            + (
+                f" The {dropped_transport} could NOT be reserved for this time. Do "
+                f"NOT tell them a {dropped_transport} is confirmed. Say: 'I've put "
+                f"a note on for a {dropped_transport} and the advisor will confirm "
+                f"that with you.'"
+                if dropped_transport else ""
+            )
         ),
         "mykaarma": result,
     }
