@@ -1105,12 +1105,36 @@ async def _attach_stated_vehicle(
     booking call would have left the caller listening to silence on top of the
     time the booking already takes. If any of it fails the appointment still
     stands and the note still names the car, so the advisor is no worse off."""
+    # SAVE UNDER THE NAME THE RECORD ALREADY CARRIES, NOT THE ONE JUST SPOKEN.
+    #
+    # myKaarma matches duplicates on name AND phone, so save_customer only adds
+    # the vehicle to an existing record when the name matches it too. Measured
+    # live 2026-09-26: a caller booked under a record stored as "Server Test",
+    # gave a different name on the call, and myKaarma created a SECOND record in
+    # that name and put the vehicle there. The appointment stayed on the first
+    # record with no vehicle, and the poll below searched for a car that was
+    # never going to appear.
+    #
+    # So look up what this record is actually called and save under that. Only
+    # fall back to the spoken name when the record has none.
+    on_file_first, on_file_last = first_name, last_name
+    try:
+        for m in await mk.search_customer(dealer, phone=phone):
+            if m.get("uuid") != customer_uuid:
+                continue
+            if (m.get("fname") or "").strip() or (m.get("lname") or "").strip():
+                on_file_first = (m.get("fname") or "").strip() or None
+                on_file_last = (m.get("lname") or "").strip() or None
+            break
+    except mk.MyKaarmaError as e:
+        log.warning("could not read the name on %s: %s", customer_uuid, e)
+
     try:
         await mk.save_customer(
             dealer,
             phone=phone,
-            first_name=first_name,
-            last_name=last_name,
+            first_name=on_file_first,
+            last_name=on_file_last,
             vehicle_year=year,
             vehicle_make=make,
             vehicle_model=model,
