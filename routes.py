@@ -187,6 +187,41 @@ def _advisor_cutoff(dealer_key: Optional[str], day: str) -> Optional[str]:
     return _NO_ADVISOR_FROM.get((dealer_key or "", weekday))
 
 
+# ── SLOTS THIS CALLER HAS ALREADY BEEN REFUSED ──────────────────────────────
+# myKaarma's availability API and its booking API disagree: get-slots offers a
+# time, create/update then answers SLOT_UNAVAILABLE. When that happened we
+# re-queried the SAME day and handed back the SAME list, so the agent offered a
+# slot it had just been refused. Measured live 2026-09-25 at St. Charles: a
+# caller cycled 9:30 -> 10:00 -> 8:30 -> 10:00, every one rejected, with no way
+# out of the loop. Remember what this caller has already been refused on this
+# call and never offer it to them again.
+#
+# Deliberately in memory and per CALLER (not per store): the refusals are about
+# this one appointment being moved, not about the store's schedule, so they must
+# not leak to the next caller. A redeploy simply forgets them.
+_REJECTED_SLOTS: Dict[Tuple[str, str], Tuple[set, float]] = {}
+_REJECTED_TTL_SECONDS = 3600.0
+
+
+def _reject_key(req: "BookRequest", customer_uuid: Optional[str]) -> Tuple[str, str]:
+    return (req.dealer_key or "", customer_uuid or req.phone or "")
+
+
+def _remember_rejected(key: Tuple[str, str], iso: str) -> None:
+    now = time.monotonic()
+    for k, (_slots, touched) in list(_REJECTED_SLOTS.items()):
+        if now - touched > _REJECTED_TTL_SECONDS:
+            _REJECTED_SLOTS.pop(k, None)
+    slots, _ = _REJECTED_SLOTS.get(key, (set(), now))
+    slots.add(iso)
+    _REJECTED_SLOTS[key] = (slots, now)
+
+
+def _rejected_slots(key: Tuple[str, str]) -> set:
+    entry = _REJECTED_SLOTS.get(key)
+    return entry[0] if entry else set()
+
+
 def _remember_no_advisor(dealer_key: Optional[str], iso: str) -> None:
     """Record a refusal so we never offer that time (or later) on this weekday."""
     try:
@@ -919,6 +954,9 @@ async def _slot_taken(
     opening at all (nobody is on the service drive then), rather than a slot someone
     else grabbed first. Same recovery, but we must not tell the caller it "was taken"."""
     spoken_wanted = _speak_datetime(wanted)
+    key = _reject_key(req, customer_uuid)
+    _remember_rejected(key, wanted)
+    refused = _rejected_slots(key)
     slots: List[str] = []
     spoken: List[str] = []
     try:
@@ -931,7 +969,7 @@ async def _slot_taken(
             dealer_key=req.dealer_key,
         ))
         for raw, say in zip(alt.get("slots") or [], alt.get("spoken_slots") or []):
-            if raw != wanted:
+            if raw not in refused:
                 slots.append(raw)
                 spoken.append(say)
     except Exception as e:  # never let the fallback lookup break the response
@@ -950,9 +988,11 @@ async def _slot_taken(
         )
     else:
         instruction = (
-            f"NOTHING IS BOOKED. {spoken_wanted} {gone} and nothing else is open that "
-            f"day. Do NOT book another time on your own. Tell the caller {say_gone} and "
-            f"ask what other day works, then call get_slots for it."
+            f"NOTHING IS BOOKED. {spoken_wanted} {gone}, and every other time that day "
+            f"has already been tried. STOP offering times on that day. Do NOT book "
+            f"another time on your own. Tell the caller: \"I'm sorry — that day "
+            f"isn't working. What other day would suit you?\" Then call get_slots for "
+            f"the day they name."
         )
 
     return {
@@ -1010,6 +1050,20 @@ async def book_appointment(req: BookRequest):
                 check_uuid = mk.parse_search_match(_ms[0])["customer_uuid"]
         except mk.MyKaarmaError:
             check_uuid = None
+    # THE PHONE SEARCH ABOVE ALREADY FOUND THIS CALLER — BOOK UNDER THAT RECORD.
+    #
+    # That search ran only to find an appointment to move, and its result was then
+    # thrown away: customer_uuid stayed empty, so step 1 below called save_customer
+    # and myKaarma minted ANOTHER record for a customer we had just located.
+    # Measured live 2026-09-25: one test phone number ended up carrying FOUR
+    # records, and two bookings made minutes apart landed on two different
+    # brand-new ones — which is why the follow-up reschedule found nothing to move.
+    # A phone match IS the caller. Use it.
+    if check_uuid and not customer_uuid:
+        customer_uuid = check_uuid
+        log.info(
+            "customer resolved by phone -> %s (no new record written)", check_uuid
+        )
     if check_uuid:
         try:
             _now = datetime.now(DEALER_TZ).replace(tzinfo=None)
@@ -1074,7 +1128,11 @@ async def book_appointment(req: BookRequest):
         req.first_name, req.last_name, req.email, req.vin,
         req.vehicle_year, req.vehicle_make, req.vehicle_model, req.phone,
     ])
-    if have_details and not reschedule_uuid and not req.customer_uuid:
+    # Gate on the RESOLVED customer_uuid, not on req.customer_uuid. The agent
+    # doesn't always send one, but a phone match above is just as good — and
+    # writing over it is what produced the duplicates.
+    _just_created = False
+    if have_details and not reschedule_uuid and not customer_uuid:
         try:
             raw = await mk.save_customer(
                 dealer,
@@ -1101,6 +1159,7 @@ async def book_appointment(req: BookRequest):
             # uuid/vehicle for a brand-new customer we had no uuid for.
             if not req.customer_uuid:
                 customer_uuid = c["customer_uuid"] or customer_uuid
+                _just_created = True
                 if not vehicle_uuid and c["vehicles"]:
                     vehicle_uuid = c["vehicles"][0]["vehicle_uuid"]
 
@@ -1151,7 +1210,7 @@ async def book_appointment(req: BookRequest):
                 break
             # Only a customer we just CREATED needs time to index. A known caller's
             # vehicles are already searchable, so waiting would only add dead air.
-            if vehicle_uuid or req.customer_uuid:
+            if vehicle_uuid or not _just_created:
                 break
             await asyncio.sleep(1.3)  # let myKaarma index the new customer/vehicle
 
