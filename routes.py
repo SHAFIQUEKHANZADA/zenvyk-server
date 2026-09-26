@@ -1074,6 +1074,39 @@ def _vehicle_matches(label: str, year, make, model) -> bool:
 _BACKGROUND_TASKS: set = set()
 
 
+async def _find_booked_record(
+    dealer: Dict[str, str], customer_uuid: str, phone: Optional[str],
+    first_name: Optional[str], last_name: Optional[str],
+) -> Optional[dict]:
+    """The raw search result for the customer we are booking under.
+
+    Normally we find them by phone. But `phone` is an OPTIONAL parameter on the
+    GHL action, so the voice model is free to leave it out — and at Kia St.
+    Charles on 2026-09-26 it did. With no phone, every vehicle step was skipped
+    and the appointment reached the drive as "Vehicle TBD" even though the
+    customer's 2025 Kia Sportage was sitting on their record.
+
+    So fall back to the name. The name alone is NOT trusted to identify anyone
+    — that same store has two different "Wasi Rahman" records — it is only used
+    to fetch candidates, and we return one solely when its uuid is the record we
+    actually booked under."""
+    terms = []
+    if phone:
+        terms.append(("phone", phone))
+    name = " ".join(x for x in (first_name, last_name) if x).strip()
+    if name:
+        terms.append(("term", name))
+    for kind, value in terms:
+        try:
+            kwargs = {kind: value}
+            for m in await mk.search_customer(dealer, **kwargs):
+                if m.get("uuid") == customer_uuid:
+                    return m
+        except mk.MyKaarmaError as e:
+            log.warning("lookup by %s failed: %s", kind, e)
+    return None
+
+
 async def _attach_stated_vehicle(
     dealer: Dict[str, str],
     appointment_uuid: str,
@@ -1129,32 +1162,34 @@ async def _attach_stated_vehicle(
     except mk.MyKaarmaError as e:
         log.warning("could not read the name on %s: %s", customer_uuid, e)
 
-    try:
-        await mk.save_customer(
-            dealer,
-            phone=phone,
-            first_name=on_file_first,
-            last_name=on_file_last,
-            vehicle_year=year,
-            vehicle_make=make,
-            vehicle_model=model,
-        )
-    except mk.MyKaarmaError as e:
-        log.warning("could not save stated vehicle for %s: %s", customer_uuid, e)
-        return
+    # With no phone we do NOT save again. The record was created moments ago by
+    # the booking itself, with this vehicle already on it, and save_customer
+    # without a phone matches on name alone — which is how a second record
+    # gets made. Nothing to add; just find it below and attach it.
+    if phone:
+        try:
+            await mk.save_customer(
+                dealer,
+                phone=phone,
+                first_name=on_file_first,
+                last_name=on_file_last,
+                vehicle_year=year,
+                vehicle_make=make,
+                vehicle_model=model,
+            )
+        except mk.MyKaarmaError as e:
+            log.warning("could not save stated vehicle for %s: %s", customer_uuid, e)
+            return
 
     # Poll until myKaarma indexes it. ~8s measured; allow generous headroom.
     for _ in range(12):
         await asyncio.sleep(2)
-        try:
-            matches = await mk.search_customer(dealer, phone=phone)
-        except mk.MyKaarmaError:
-            continue
-        for m in matches:
-            # ONLY a vehicle on the customer we actually booked under. myKaarma
-            # rejects a uuid from any other record with VEHICLE_UUID_NOT_FOUND.
-            if m.get("uuid") != customer_uuid:
-                continue
+        # ONLY a vehicle on the customer we actually booked under. myKaarma
+        # rejects a uuid from any other record with VEHICLE_UUID_NOT_FOUND.
+        m = await _find_booked_record(
+            dealer, customer_uuid, phone, first_name, last_name
+        )
+        if m:
             for v in mk.parse_search_match(m)["vehicles"]:
                 if not _vehicle_matches(v.get("label"), year, make, model):
                     continue
@@ -1338,7 +1373,11 @@ async def book_appointment(req: BookRequest):
     #     appointment used to book with an empty vehicle → "Not selected at booking"
     #     in the DMS/dispatch. The customer search DOES return vehicle uuids, so look
     #     the customer back up and grab the vehicle that matches what they told us.
-    if not vehicle_uuid and req.phone and not reschedule_uuid:
+    # Gated on having a CUSTOMER, not on having a phone. `phone` is optional on
+    # the GHL action, and a call at Kia St. Charles on 2026-09-26 arrived without
+    # one — which skipped this block entirely and left the appointment showing
+    # "Vehicle TBD" while the customer's Sportage sat on their record.
+    if not vehicle_uuid and customer_uuid and not reschedule_uuid:
         want = " ".join(
             str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
         ).lower()
@@ -1350,13 +1389,10 @@ async def book_appointment(req: BookRequest):
         # fails with VEHICLE_UUID_NOT_FOUND), and SKIP the auto-created "No Vehicle
         # Selected" placeholder — always prefer a real vehicle.
         for attempt in range(4):
-            try:
-                matches = await mk.search_customer(dealer, phone=req.phone)
-            except mk.MyKaarmaError:
-                matches = []
-            for m in matches:
-                if m.get("uuid") != customer_uuid:
-                    continue
+            m = await _find_booked_record(
+                dealer, customer_uuid, req.phone, req.first_name, req.last_name
+            )
+            if m:
                 real = [
                     v for v in mk.parse_search_match(m)["vehicles"]
                     if "no vehicle selected" not in (v.get("label") or "").lower()
@@ -1376,7 +1412,6 @@ async def book_appointment(req: BookRequest):
                 # vehicle, and the stated vehicle goes into the notes below.
                 if not vehicle_uuid and real and not want:
                     vehicle_uuid = real[0]["vehicle_uuid"]
-                break
             # Only a customer we just CREATED needs time to index. A known caller's
             # vehicles are already searchable, so waiting would only add dead air.
             if vehicle_uuid or not _just_created:
