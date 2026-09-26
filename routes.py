@@ -1117,6 +1117,7 @@ async def _attach_stated_vehicle(
     year: Optional[str],
     make: Optional[str],
     model: Optional[str],
+    customer_is_new: bool = False,
 ) -> None:
     """Put the car the caller named ON the customer, then ON the appointment.
 
@@ -1166,7 +1167,19 @@ async def _attach_stated_vehicle(
     # the booking itself, with this vehicle already on it, and save_customer
     # without a phone matches on name alone — which is how a second record
     # gets made. Nothing to add; just find it below and attach it.
-    if phone:
+    # AND DO NOT SAVE AGAIN WHEN WE JUST CREATED THIS CUSTOMER.
+    #
+    # The booking's own save_customer already put this vehicle on the new record,
+    # so there is nothing to add — and calling it a second time seconds later is
+    # actively harmful: myKaarma has not indexed the record yet, its duplicate
+    # check does not see it, and it creates a twin.
+    #
+    # Measured live 2026-09-25 at Acura Libertyville. A booking made one record
+    # at 19:58 and a second one seconds behind it, both on the same phone and
+    # name. The next call then booked onto one twin while the car it added
+    # landed on the other, so the attach could not find it and the appointment
+    # kept myKaarma's placeholder.
+    if phone and not customer_is_new:
         try:
             await mk.save_customer(
                 dealer,
@@ -1595,6 +1608,7 @@ async def book_appointment(req: BookRequest):
                 dealer, _appt_uuid, customer_uuid, req.phone,
                 req.first_name, req.last_name,
                 req.vehicle_year, req.vehicle_make, req.vehicle_model,
+                customer_is_new=_just_created,
             ))
             _BACKGROUND_TASKS.add(_task)
             _task.add_done_callback(_BACKGROUND_TASKS.discard)
