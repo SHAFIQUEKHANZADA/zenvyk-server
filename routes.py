@@ -1180,6 +1180,33 @@ async def _attach_stated_vehicle(
     # landed on the other, so the attach could not find it and the appointment
     # kept myKaarma's placeholder.
     if phone and not customer_is_new:
+        # NEVER SAVE UNTIL myKAARMA CAN SEE THIS CUSTOMER.
+        #
+        # save_customer decides whether someone already exists by SEARCHING, and
+        # a record takes roughly eight seconds to reach that index. Call it before
+        # then and myKaarma cannot find the person, so it creates them again.
+        # That is how both sets of duplicates happened — at Kia because no phone
+        # was sent to search on, at Libertyville because the record was one second
+        # old.
+        #
+        # So confirm the record is findable FIRST. If it never becomes findable we
+        # do not save at all: the appointment still stands, the note still names
+        # the car, and no twin gets created. Losing the vehicle is recoverable;
+        # a duplicate customer is not.
+        for _ in range(10):
+            if await _find_booked_record(
+                dealer, customer_uuid, phone, on_file_first, on_file_last
+            ):
+                break
+            await asyncio.sleep(2)
+        else:
+            log.warning(
+                "customer %s never became searchable — NOT saving %s %s %s, "
+                "because myKaarma would create a duplicate",
+                customer_uuid, year, make, model,
+            )
+            return
+
         try:
             await mk.save_customer(
                 dealer,
