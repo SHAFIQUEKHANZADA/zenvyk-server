@@ -246,36 +246,18 @@ def _vehicle_year(v: dict) -> int:
         return -1
 
 
-def _vehicle_added(v: dict) -> int:
-    """How recently myKaarma recorded this vehicle. Higher is more recent.
-
-    myKaarma returns no timestamp on a vehicle, but it does return an `id` from a
-    global incrementing sequence, so a larger id was created later. Verified live
-    2026-09-26 against a record whose vehicles were added in a known order —
-    every id matched that order exactly.
-
-    It is an undocumented internal field, so it is a HINT, not the whole key:
-    _vehicle_rank falls back to model year whenever it is missing."""
-    try:
-        return int(v.get("id") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _vehicle_rank(v: dict) -> tuple:
-    """Sort key: describable vehicles first, then MOST RECENTLY ADDED first.
+    """Sort key: vehicles we can fully describe first, then NEWEST MODEL YEAR.
 
-    This used to sort on model year, so the newest car by year was offered. That
-    is an assumption about which car someone drives; when they last had a car
-    recorded here is something that actually happened. Measured live 2026-09-26:
-    a caller whose newest-by-year car was a 2021 Civic had just told us about a
-    2015 Vitz, and Esther still offered the Civic.
-
-    Model year stays as the tiebreaker, so if myKaarma ever stops returning `id`
-    this quietly returns to the old behaviour rather than sorting at random."""
+    We briefly sorted on myKaarma's vehicle `id` instead, to offer whichever car
+    was recorded most recently. Reverted 2026-09-26 after hearing it live: a
+    caller with a 2010 Civic, a 2025 Accord and a 2023 Ridgeline on file was
+    offered the 2010 first, because that was the one last touched. Newest year
+    is the better guess about the car someone actually drives, and it is what
+    the store expects to hear."""
     model = str(v.get("model") or "").strip().lower()
     described = bool(model) and not any(j in model for j in VEHICLE_JUNK)
-    return (described, _vehicle_added(v), _vehicle_year(v))
+    return (described, _vehicle_year(v))
 
 
 def parse_search_match(match: dict) -> dict:
