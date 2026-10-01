@@ -445,6 +445,31 @@ def _is_yes(answer: Optional[str]) -> Optional[bool]:
     return None
 
 
+# An explicit refusal, as opposed to the "no, I haven't been appraised" the
+# single-question flow is looking for. A plain "no" is the opportunity, so only
+# these clear brush-offs count as a decline — and a decline never fires an alert.
+_DECLINE_PHRASES = re.compile(
+    r"\b(not interested|no thanks|no thank you|"
+    r"(i|we)m good|(i|we)re good|i am good|we are good|all set|"
+    r"not (now|today|right now|at (the )?moment)|"
+    r"another time|some other time|maybe later|later|busy|"
+    r"pass|leave me alone|(do ?nt|do not) contact|stop texting)\b",
+    re.I,
+)
+
+
+def _is_decline(answer: Optional[str]) -> bool:
+    """True only for an explicit brush-off, so a plain 'no' stays the opportunity."""
+    if not answer:
+        return False
+    s = str(answer).strip().lower()
+    s = _STRETCH.sub(r"\1", s)
+    s = re.sub(r"['‘’ʼ`]", "", s)
+    s = re.sub(r"[!.,;:*~]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return bool(_DECLINE_PHRASES.search(s))
+
+
 def _vehicle_label(req) -> str:
     return " ".join(
         str(x) for x in (req.vehicle_year, req.vehicle_make, req.vehicle_model) if x
@@ -682,6 +707,14 @@ DECLINE_MESSAGE = (
 VALUE_ONLY_MESSAGE = (
     "Sounds good - we'll have that number ready for you. Just ask your service "
     "advisor before you head out if you'd like to see it."
+)
+
+# Reid's updated single-question script (Oct 2026): sent when the customer says
+# they HAVEN'T been appraised — the opportunity. The acquisition team is alerted
+# at the same moment and comes to find them in person.
+ACQUISITION_MESSAGE = (
+    "Perfect! A member of our acquisition team will be with you shortly! "
+    "It only takes a few minutes and there's no obligation."
 )
 
 
@@ -983,159 +1016,112 @@ async def equity_response(req: ResponseRequest):
                      "Nothing sent, nothing counted."),
         }
 
-    # ── Question 1: do you want to know what it's worth? ─────────────────────
-    if step == "value_offer":
-        if yes is True:
-            _expect_second_answer(req.phone)
-            # Reid, 19 Sep: "Can we get an alert when somebody says yes to the
-            # appraisal." That is THIS yes, not the second one. Until now the
-            # desk heard nothing until the customer also agreed to be walked
-            # over, so a yes that stalled at question two was invisible.
-            #
-            # The notice rides along inside the Q2 push rather than going to a
-            # webhook of its own: GHL inbound webhook triggers are premium and
-            # billed per execution, and the Q2 workflow is already firing at
-            # exactly this moment. One execution, two outcomes -- the customer
-            # text and an Internal Notification step using these fields.
-            notice = _sms_safe("\n".join([
-                f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
-                f"In for service: {_spoken_time(req.appointment_time) or 'today'}",
-                "Said YES to a trade value — appraisal scheduled",
-                f"Priority {pri['score']}/100 ({pri['band'].upper()})",
-                "Not ready to be approached yet. Have the number ready.",
-            ]))
-            # Reid watches "Appraisals Scheduled" while the customer is still
-            # in the lounge, so this is written now rather than waiting for the
-            # dashboard's 15-minute ingest. It never raises.
-            recorded = await dashboard.record_appraisal(
-                req.dealer_key, req.phone,
-                customer_name=req.first_name,
-                vehicle=label,
-                priority_score=pri["score"],
-                priority_band=pri["band"],
-                appointment_time=req.appointment_time,
-            )
-            push = await _push_to_ghl(req.dealer_key, {
-                "phone": req.phone,
-                "first_name": req.first_name,
-                "equity_message": SEE_OPTIONS_MESSAGE,
-                "appraisal_notice": notice,
-                "vehicle": label,
-                "appointment_time": req.appointment_time,
-                "equity_priority_band": pri["band"],
-                "equity_priority_score": pri["score"],
-            }, kind="Q2")
-            return {
-                "step": step, "answer": "yes",
-                "next_message": SEE_OPTIONS_MESSAGE,
-                "next_step": "see_options",
-                # Still false: this notice tells the desk to have a number
-                # ready, it does not send anyone across the showroom. Walking
-                # over on this yes is the thing Reid explicitly ruled out.
-                "fire_salesperson_alert": False,
-                "appraisal_scheduled": True,
-                "appraisal_notice": notice,
-                "dashboard": recorded,
-                "priority_score": pri["score"],
-                "priority_band": pri["band"],
-                "tags": ["equity-value-yes", "equity-appraisal-scheduled"],
-                "ghl": push,
-            }
-        if yes is False:
-            return {
-                "step": step, "answer": "no",
-                "next_message": DECLINE_MESSAGE,
-                "fire_salesperson_alert": False,
-                "tags": ["equity-declined"],
-                "note": (f"Suppress for {DECLINE_COOLDOWN_DAYS} days. Set "
-                         f"last_declined_date on the contact."),
-            }
-        return {
-            "step": step, "answer": "unclear",
-            # Echoed so the GHL execution log shows what actually arrived. An
-            # empty `received` means the webhook step isn't sending the message
-            # body, not that the customer typed something odd -- and those two
-            # look identical from the GHL side.
-            "received": answer,
-            "next_message": None, "fire_salesperson_alert": False,
-            "tags": ["equity-reply-unclear"],
-            "note": "Reply wasn't a clear yes or no — route to a human, don't guess.",
-        }
+    # ── Single-question flow (Reid's updated script, Oct 2026) ───────────────
+    # The opener asked whether they've had their vehicle professionally appraised
+    # lately. A customer who says NO hasn't been appraised — that is the
+    # opportunity, so the acquisition hand-off goes out AND the team alert fires
+    # right away. A customer who says YES has already been appraised, so the
+    # thread just closes. An explicit brush-off is honoured quietly, and an
+    # unreadable reply still goes to a human rather than being guessed at.
+    #
+    # Replaces the earlier two-yes flow (value_offer -> see_options). Both old
+    # steps resolve here, so a contact mid-transition is handled too.
 
-    # ── Question 2: want to look at options while you're here? ───────────────
-    if step == "see_options":
-        _AWAITING.pop(req.phone or "", None)
-        if yes is True:
-            _clean_claims()
-            if req.phone:
-                _CLAIMS[req.phone] = {
-                    "phone": req.phone,
-                    "name": req.first_name or "Customer",
-                    "vehicle": label or "their vehicle",
-                    "dealer_key": req.dealer_key,
-                    "appointment_time": req.appointment_time,
-                    "priority_score": pri["score"],
-                    "priority_band": pri["band"],
-                    "reasons": pri["reasons"],
-                    "status": "unclaimed",
-                    "salesperson": None,
-                    "at": time.time(),
-                }
-            await dashboard.mark_wants_options(req.dealer_key, req.phone)
-            alert = [
-                f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
-                f"In for service: {_spoken_time(req.appointment_time) or 'today'}",
-                "Wants to see options — walk over now",
-                f"Priority {pri['score']}/100 ({pri['band'].upper()})",
-            ] + [f"- {r}" for r in pri["reasons"]]
-            log.info("equity alert %s %s priority=%s", req.first_name, label,
-                     pri["score"])
-            card = _sms_safe("\n".join(alert))
-            push = await _push_to_ghl(req.dealer_key, {
-                "phone": req.phone,
-                "first_name": req.first_name,
-                "equity_message": CONFIRM_MESSAGE,
-                "alert_card": card,
-                "vehicle": label,
-                "equity_priority_band": pri["band"],
-                "equity_priority_score": pri["score"],
-                "appointment_time": req.appointment_time,
-            }, kind="ALERT")
-            return {
-                "step": step, "answer": "yes",
-                "next_message": CONFIRM_MESSAGE,
-                "fire_salesperson_alert": True,
-                # The desk gets this as an SMS too, so it takes the same
-                # GSM-7 treatment as the customer copy.
-                "alert_card": _sms_safe("\n".join(alert)),
-                "priority_score": pri["score"],
-                "priority_band": pri["band"],
-                "claim_timeout_seconds": CLAIM_TIMEOUT_SECONDS,
-                "tags": ["equity-wants-options", "equity-alert-sent"],
-                "note": (
-                    "Do NOT state a value in any message. The salesperson gives "
-                    "the estimated range in person. If nobody claims within "
-                    f"{CLAIM_TIMEOUT_SECONDS // 60} minutes, fall back to the BDC."
-                ),
-            }
-        if yes is False:
-            return {
-                "step": step, "answer": "no",
-                "next_message": VALUE_ONLY_MESSAGE,
-                "fire_salesperson_alert": False,
-                "tags": ["equity-value-yes", "equity-options-no"],
-                "note": ("They still want the number — have the advisor hand it "
-                         "over. Do not send a salesperson to the lounge."),
-            }
+    # "Not interested / no thanks / I'm good" is a refusal, not the "no, I haven't
+    # been appraised" we want — never send a salesperson after someone who said no.
+    if _is_decline(answer):
         return {
-            "step": step, "answer": "unclear", "next_message": None,
-            "received": answer,
+            "step": step, "answer": "declined",
+            "next_message": DECLINE_MESSAGE,
             "fire_salesperson_alert": False,
-            "tags": ["equity-reply-unclear"],
+            "tags": ["equity-declined", "equity-done"],
+            "note": (f"Explicit decline. Suppress for {DECLINE_COOLDOWN_DAYS} days; "
+                     f"set last_declined_date on the contact."),
         }
 
-    return {"error": "unknown_step", "step": step,
-            "note": "step must be 'value_offer' or 'see_options'"}
+    # "No, I haven't been appraised" — the opportunity. Hand off + alert now.
+    if yes is False:
+        _clean_claims()
+        if req.phone:
+            _CLAIMS[req.phone] = {
+                "phone": req.phone,
+                "name": req.first_name or "Customer",
+                "vehicle": label or "their vehicle",
+                "dealer_key": req.dealer_key,
+                "appointment_time": req.appointment_time,
+                "priority_score": pri["score"],
+                "priority_band": pri["band"],
+                "reasons": pri["reasons"],
+                "status": "unclaimed",
+                "salesperson": None,
+                "at": time.time(),
+            }
+        # Written while the customer is still on site (never raises).
+        await dashboard.record_appraisal(
+            req.dealer_key, req.phone,
+            customer_name=req.first_name,
+            vehicle=label,
+            priority_score=pri["score"],
+            priority_band=pri["band"],
+            appointment_time=req.appointment_time,
+        )
+        await dashboard.mark_wants_options(req.dealer_key, req.phone)
+        alert = [
+            f"{req.first_name or 'Customer'} — {label or 'vehicle'}",
+            f"In for service: {_spoken_time(req.appointment_time) or 'today'}",
+            "Hasn't been appraised — walk over now",
+            f"Priority {pri['score']}/100 ({pri['band'].upper()})",
+        ] + [f"- {r}" for r in pri["reasons"]]
+        log.info("equity alert (no-appraisal) %s %s priority=%s",
+                 req.first_name, label, pri["score"])
+        card = _sms_safe("\n".join(alert))
+        push = await _push_to_ghl(req.dealer_key, {
+            "phone": req.phone,
+            "first_name": req.first_name,
+            "equity_message": ACQUISITION_MESSAGE,
+            "alert_card": card,
+            "vehicle": label,
+            "equity_priority_band": pri["band"],
+            "equity_priority_score": pri["score"],
+            "appointment_time": req.appointment_time,
+        }, kind="ALERT")
+        return {
+            "step": step, "answer": "no_not_appraised",
+            "next_message": ACQUISITION_MESSAGE,
+            "fire_salesperson_alert": True,
+            "alert_card": card,
+            "appraisal_scheduled": True,
+            "priority_score": pri["score"],
+            "priority_band": pri["band"],
+            "claim_timeout_seconds": CLAIM_TIMEOUT_SECONDS,
+            "tags": ["equity-appraisal-scheduled", "equity-alert-sent", "equity-done"],
+            "ghl": push,
+            "note": (
+                "Do NOT state a value in any message. The team gives the estimated "
+                "range in person. If nobody claims within "
+                f"{CLAIM_TIMEOUT_SECONDS // 60} minutes, fall back to the BDC."
+            ),
+        }
+
+    # "Yes, I've already been appraised" — nothing further.
+    if yes is True:
+        return {
+            "step": step, "answer": "already_appraised",
+            "next_message": None,
+            "fire_salesperson_alert": False,
+            "tags": ["equity-already-appraised", "equity-done"],
+            "note": "Already appraised — no follow-up, conversation closed.",
+        }
+
+    # Unreadable — route to a human, don't guess.
+    return {
+        "step": step, "answer": "unclear",
+        "received": answer,
+        "next_message": None,
+        "fire_salesperson_alert": False,
+        "tags": ["equity-reply-unclear"],
+        "note": "Reply wasn't a clear yes or no — route to a human, don't guess.",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

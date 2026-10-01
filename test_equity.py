@@ -137,45 +137,45 @@ def test_eligible_customer_gets_a_compliant_message():
     msg = r["message"]
     # Marketing text -> must carry an opt-out.
     assert "STOP" in msg
-    # "Appraisal" is regulated language in several states.
-    assert "appraisal" not in msg.lower()
+    # Reid's single-question opener asks whether they've been appraised lately.
+    assert "appraised" in msg.lower()
     # We have no valuation source. No figure may ever appear.
     assert "$" not in msg
     assert "Dan" in msg
-    # Sent while they are AT the dealership, so it must say so - the
-    # salesperson walk-over only works if the customer is on site.
-    assert "today" in msg.lower()
 
 
-# ── The two-step thread ───────────────────────────────────────────────────────
-def test_first_yes_does_not_fire_the_alert():
-    """Reid was explicit: wanting a number is not wanting to be approached."""
+# ── The single-question flow (Reid's updated script, Oct 2026) ────────────────
+def test_yes_means_already_appraised_and_does_not_fire_the_alert():
+    """A 'yes' now means they've ALREADY been appraised, so the thread just
+    closes -- no salesperson is sent, nothing is pushed."""
     r = respond(step="value_offer", answer="yes", phone="6305550147",
                 vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
+    assert r["answer"] == "already_appraised"
     assert r["fire_salesperson_alert"] is False
-    assert r["next_step"] == "see_options"
+    assert r["next_message"] is None
+    assert "equity-already-appraised" in r["tags"]
 
 
-def test_first_yes_notifies_the_desk_that_an_appraisal_is_scheduled():
-    """Reid, 19 Sep: "Can we get an alert when somebody says yes to the
-    appraisal." Before this the desk heard nothing until the second yes, so a
-    customer who stalled at question two was invisible to the store."""
-    r = respond(step="value_offer", answer="yes", phone="6305550147",
+def test_no_schedules_the_appraisal_and_alerts_the_desk():
+    """Reid's single-question flow: a 'no' means they HAVEN'T been appraised --
+    the opportunity. The acquisition hand-off goes out and the desk alert fires
+    at the same moment."""
+    r = respond(step="value_offer", answer="no", phone="6305550147",
                 first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
                 vehicle_model="CR-V", appointment_time="Tue 9:00 AM")
     assert r["appraisal_scheduled"] is True
     assert "equity-appraisal-scheduled" in r["tags"]
-    notice = r["appraisal_notice"]
-    assert "Dan" in notice and "CR-V" in notice
-    # The desk must be told to prepare, NOT to walk over. Those are different
-    # instructions and confusing them is the failure Reid warned about.
-    assert "walk over" not in notice.lower()
-    assert r["fire_salesperson_alert"] is False
+    assert "equity-alert-sent" in r["tags"]
+    card = r["alert_card"]
+    assert "Dan" in card and "CR-V" in card
+    # A customer who hasn't been appraised IS the one to walk over to now.
+    assert "walk over" in card.lower()
+    assert r["fire_salesperson_alert"] is True
 
 
-def test_appraisal_notice_rides_inside_the_existing_q2_push(monkeypatch):
-    """Not its own webhook. GHL inbound triggers are billed per execution and
-    the Q2 workflow already runs at this exact moment."""
+def test_the_no_path_pushes_one_alert_webhook(monkeypatch):
+    """A single push, to the ALERT workflow, carrying both the customer's next
+    text (the acquisition hand-off) and the desk's alert card."""
     sent = []
 
     async def spy(dealer_key, payload, kind=""):
@@ -183,40 +183,46 @@ def test_appraisal_notice_rides_inside_the_existing_q2_push(monkeypatch):
         return {"pushed": True}
 
     monkeypatch.setattr(equity, "_push_to_ghl", spy)
-    respond(step="value_offer", answer="yes", phone="6305550147",
+    respond(step="value_offer", answer="no", phone="6305550147",
             first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
             vehicle_model="CR-V")
 
-    assert [k for k, _ in sent] == ["Q2"], "one push only, no second webhook"
+    assert [k for k, _ in sent] == ["ALERT"], "one push only, the desk alert"
     payload = sent[0][1]
-    assert payload["appraisal_notice"]
-    # The customer's next text still has to be in there, or the thread stops.
-    assert payload["equity_message"] == equity.SEE_OPTIONS_MESSAGE
+    assert payload["alert_card"]
+    # The customer's next text still has to ride in the push, or the thread stops.
+    assert payload["equity_message"] == equity.ACQUISITION_MESSAGE
 
 
-def test_appraisal_notice_never_states_a_figure():
-    r = respond(step="value_offer", answer="yes", phone="6305550147",
+def test_the_acquisition_message_never_states_a_figure():
+    r = respond(step="value_offer", answer="no", phone="6305550147",
                 first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
                 vehicle_model="CR-V")
-    assert "$" not in r["appraisal_notice"]
+    assert "$" not in r["next_message"]
+    assert "$" not in r["alert_card"]
 
 
-def test_second_yes_fires_the_alert():
-    r = respond(step="see_options", answer="sure", phone="6305550147",
+def test_a_no_fires_the_alert():
+    r = respond(step="see_options", answer="no", phone="6305550147",
                 first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
                 vehicle_model="CR-V", mileage="34k",
                 appointment_time="Tue 9:00 AM")
     assert r["fire_salesperson_alert"] is True
+    assert r["answer"] == "no_not_appraised"
     assert "Dan" in r["alert_card"]
     assert r["claim_timeout_seconds"] == equity.CLAIM_TIMEOUT_SECONDS
     # Still no figure anywhere in what the customer receives.
     assert "$" not in r["next_message"]
 
 
-def test_no_to_options_still_gives_them_the_number_in_person():
+def test_an_explicit_decline_sends_the_decline_message_and_no_alert():
+    """'No thanks' is an explicit brush-off, not the 'no, I haven't been
+    appraised' opportunity -- never send a salesperson after someone who said no."""
     r = respond(step="see_options", answer="no thanks", phone="6305550147")
     assert r["fire_salesperson_alert"] is False
-    assert "equity-options-no" in r["tags"]
+    assert r["answer"] == "declined"
+    assert r["next_message"] == equity.DECLINE_MESSAGE
+    assert "equity-declined" in r["tags"]
 
 
 def test_stop_is_an_opt_out_not_a_no():
@@ -236,7 +242,7 @@ def test_unclear_reply_is_routed_to_a_human():
 
 # ── The claim board ───────────────────────────────────────────────────────────
 def test_two_salespeople_cannot_claim_the_same_customer():
-    respond(step="see_options", answer="yes", phone="6305550147",
+    respond(step="value_offer", answer="no", phone="6305550147",
             first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
             vehicle_model="CR-V")
 
@@ -250,7 +256,7 @@ def test_two_salespeople_cannot_claim_the_same_customer():
 
 
 def test_release_puts_it_back_on_the_board():
-    respond(step="see_options", answer="yes", phone="6305550147",
+    respond(step="value_offer", answer="no", phone="6305550147",
             vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
     claim(phone="6305550147", salesperson="Mitch", action="claim")
     claim(phone="6305550147", salesperson="Mitch", action="release")
@@ -259,7 +265,7 @@ def test_release_puts_it_back_on_the_board():
 
 
 def test_presented_and_sold_are_logged_for_the_funnel():
-    respond(step="see_options", answer="yes", phone="6305550147",
+    respond(step="value_offer", answer="no", phone="6305550147",
             vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
     claim(phone="6305550147", salesperson="Mitch", action="claim")
     assert claim(phone="6305550147", action="presented")["status"] == "presented"
@@ -272,7 +278,7 @@ def test_claiming_something_that_does_not_exist():
 
 
 def test_claim_times_out_to_the_bdc():
-    respond(step="see_options", answer="yes", phone="6305550147",
+    respond(step="value_offer", answer="no", phone="6305550147",
             vehicle_year="2022", vehicle_make="Honda", vehicle_model="CR-V")
     claim(phone="6305550147", salesperson="Mitch", action="claim")
     # Wind the clock past the timeout rather than sleeping through it.
@@ -282,10 +288,10 @@ def test_claim_times_out_to_the_bdc():
 
 
 def test_board_sorts_highest_priority_first():
-    respond(step="see_options", answer="yes", phone="1111111111",
+    respond(step="value_offer", answer="no", phone="1111111111",
             first_name="Old", vehicle_year="2016", vehicle_make="Honda",
             vehicle_model="Civic", mileage="160k")
-    respond(step="see_options", answer="yes", phone="2222222222",
+    respond(step="value_offer", answer="no", phone="2222222222",
             first_name="Prime", vehicle_year="2023", vehicle_make="Acura",
             vehicle_model="MDX", mileage="18k", is_lease=True,
             lease_months_remaining=3)
@@ -387,7 +393,8 @@ def test_eligible_customers_are_pushed_once(monkeypatch):
     assert "equity_message" in sent and "STOP" in sent["equity_message"]
 
 
-def test_first_yes_pushes_the_second_question(monkeypatch):
+def test_a_yes_pushes_nothing(monkeypatch):
+    """A 'yes' means already appraised -- the thread closes, no webhook fires."""
     calls = []
 
     async def spy(dealer_key, payload, kind=""):
@@ -396,10 +403,10 @@ def test_first_yes_pushes_the_second_question(monkeypatch):
 
     monkeypatch.setattr(equity, "_push_to_ghl", spy)
     respond(step="value_offer", answer="yes", phone="6305550147")
-    assert calls == ["Q2"]
+    assert calls == []
 
 
-def test_second_yes_pushes_the_desk_alert(monkeypatch):
+def test_a_no_pushes_the_desk_alert(monkeypatch):
     calls = []
 
     async def spy(dealer_key, payload, kind=""):
@@ -407,14 +414,14 @@ def test_second_yes_pushes_the_desk_alert(monkeypatch):
         return {"pushed": True}
 
     monkeypatch.setattr(equity, "_push_to_ghl", spy)
-    respond(step="see_options", answer="yes", phone="6305550147",
+    respond(step="see_options", answer="no", phone="6305550147",
             first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
             vehicle_model="CR-V")
     assert [k for k, _ in calls] == ["ALERT"]
     assert "Dan" in calls[0][1]["alert_card"]
 
 
-def test_a_no_pushes_nothing(monkeypatch):
+def test_a_decline_or_optout_pushes_nothing(monkeypatch):
     calls = []
 
     async def spy(dealer_key, payload, kind=""):
@@ -459,26 +466,26 @@ def test_per_store_env_var_wins_over_the_default(monkeypatch):
 
 
 # ── Working out which question a reply answers ───────────────────────────────
-def test_the_server_remembers_which_question_is_outstanding():
+def test_the_server_remembers_an_open_equity_conversation():
     """This account's GHL offers no merge field for contact tags, so the reply
-    webhook cannot tell us which question it answers. GHL sends the Equity Step
-    contact field for the first reply; from there the server tracks it."""
+    webhook cannot always tell us whether an equity conversation is open. When
+    the server is awaiting this phone's answer it resolves the reply as an
+    equity reply; with nothing open it does not."""
     equity._AWAITING.clear()
-    first = respond(step="value_offer", answer="yes", phone="6305550147")
-    assert first["step"] == "value_offer"
-    assert first["fire_salesperson_alert"] is False
+    # Nothing open, no step -> the reply is not treated as an equity reply.
+    cold = respond(answer="no", phone="6305550147")
+    assert cold["answer"] == "not_ours"
+    assert cold["fire_salesperson_alert"] is False
 
-    # The first yes pushed question two, so the NEXT reply answers that one
-    # even with no step sent.
-    second = respond(answer="yes", phone="6305550147")
-    assert second["step"] == "see_options"
-    assert second["fire_salesperson_alert"] is True
-
-    # Afterwards the conversation is closed. A further reply with no step is
-    # NOT assumed to be a fresh equity thread -- see
-    # test_a_reply_from_another_campaign_is_ignored.
-    third = respond(answer="yes", phone="6305550147")
-    assert third["answer"] == "not_ours"
+    # Once the server notes this phone owes an answer, a reply with no step
+    # resolves to the open equity question and is handled.
+    equity._expect_second_answer("6305550147")
+    live = respond(answer="no", phone="6305550147", first_name="Dan",
+                   vehicle_year="2022", vehicle_make="Honda",
+                   vehicle_model="CR-V")
+    assert live["step"] == "see_options"
+    assert live["answer"] == "no_not_appraised"
+    assert live["fire_salesperson_alert"] is True
 
 
 def test_tags_win_when_ghl_does_send_them():
@@ -495,9 +502,9 @@ def test_a_stale_conversation_is_dropped_not_restarted():
     is not question two -- and it is not a new question one either, because
     nothing said this customer is back in for service."""
     equity._AWAITING.clear()
-    respond(step="value_offer", answer="yes", phone="6305550147")
+    equity._expect_second_answer("6305550147")
     equity._AWAITING["6305550147"] -= equity.AWAITING_TTL_SECONDS + 1
-    late = respond(answer="yes", phone="6305550147")
+    late = respond(answer="no", phone="6305550147")
     assert late["answer"] == "not_ours"
     assert late["fire_salesperson_alert"] is False
 
@@ -522,29 +529,37 @@ def test_stop_works_whichever_question_they_are_on():
 # ambiguous, which is why it took a day to find.
 
 def test_reply_text_is_recovered_when_answer_arrives_empty():
+    # `answer` empty, but the reply body ("no") is recovered from `message`,
+    # so it is read as the opportunity and fires the alert.
     r = respond(step="value_offer", answer="", phone="6305550147",
-                first_name="Dan", message="yes")
-    assert r["answer"] == "yes"
-    assert r["next_step"] == "see_options"
+                first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
+                vehicle_model="CR-V", message="no")
+    assert r["answer"] == "no_not_appraised"
+    assert r["fire_salesperson_alert"] is True
 
 
 @pytest.mark.parametrize("key", ["message", "message_body", "messageBody",
                                  "body", "last_message", "sms", "text"])
 def test_every_known_message_key_is_accepted(key):
-    r = respond(**{"step": "value_offer", "phone": "6305550147", key: "yes"})
-    assert r["answer"] == "yes"
+    # The reply body ("no") must be read from each key GHL might use for it.
+    r = respond(**{"step": "value_offer", "phone": "6305550147", key: "no"})
+    assert r["answer"] == "no_not_appraised"
 
 
 def test_nested_message_object_is_read():
+    # The body is pulled out of the nested object; "sure thing" is a yes, so
+    # the customer has already been appraised.
     r = respond(step="value_offer", phone="6305550147",
                 message={"body": "sure thing"})
-    assert r["answer"] == "yes"
+    assert r["answer"] == "already_appraised"
 
 
 def test_an_explicit_answer_still_wins_over_the_extras():
+    # `answer` ("no thanks", an explicit decline) must win over `message`
+    # ("no", which would otherwise be the opportunity).
     r = respond(step="value_offer", answer="no thanks", phone="6305550147",
-                message="yes")
-    assert r["answer"] == "no"
+                message="no")
+    assert r["answer"] == "declined"
 
 
 def test_stop_is_honoured_when_it_arrives_in_an_extra_field():
@@ -605,8 +620,8 @@ def mykaarma_knows_the_car(monkeypatch):
     monkeypatch.setattr(equity.mk, "get_customer_appointments", _appts)
 
 
-def test_second_yes_recovers_the_vehicle_from_mykaarma(mykaarma_knows_the_car):
-    r = respond(step="see_options", answer="yes sure", phone="6305550147",
+def test_a_no_recovers_the_vehicle_from_mykaarma(mykaarma_knows_the_car):
+    r = respond(step="see_options", answer="no", phone="6305550147",
                 first_name="Shafique", appointment_time="today")
     assert r["fire_salesperson_alert"] is True
     assert "CR-V" in r["alert_card"], r["alert_card"]
@@ -615,10 +630,10 @@ def test_second_yes_recovers_the_vehicle_from_mykaarma(mykaarma_knows_the_car):
     assert r["priority_band"] != COLD
 
 
-def test_appraisal_notice_also_names_the_car(mykaarma_knows_the_car):
-    r = respond(step="value_offer", answer="yes", phone="6305550147",
+def test_the_alert_card_also_names_the_car(mykaarma_knows_the_car):
+    r = respond(step="value_offer", answer="no", phone="6305550147",
                 first_name="Shafique")
-    assert "CR-V" in r["appraisal_notice"]
+    assert "CR-V" in r["alert_card"]
     assert r["priority_score"] > 0
 
 
@@ -642,7 +657,7 @@ def test_a_failing_lookup_still_sends_the_customer_their_reply(monkeypatch):
         raise equity.mk.MyKaarmaError(503, "myKaarma down", "search")
 
     monkeypatch.setattr(equity.mk, "search_customer", _boom)
-    r = respond(step="see_options", answer="yes", phone="6305550147",
+    r = respond(step="see_options", answer="no", phone="6305550147",
                 first_name="Dan")
     # Degraded alert, unbroken thread.
     assert r["fire_salesperson_alert"] is True
@@ -671,8 +686,8 @@ def dashboard_spy(monkeypatch):
     return calls
 
 
-def test_first_yes_is_recorded_on_the_dashboard(dashboard_spy):
-    respond(step="value_offer", answer="yes", phone="6305550147",
+def test_a_no_is_recorded_on_the_dashboard(dashboard_spy):
+    respond(step="value_offer", answer="no", phone="6305550147",
             first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
             vehicle_model="CR-V", appointment_time="Tue 9:00 AM",
             dealer_key="mcgrath_honda_stcharles")
@@ -690,11 +705,13 @@ def test_a_no_is_not_recorded_as_an_appraisal(dashboard_spy):
     assert dashboard_spy["recorded"] == []
 
 
-def test_second_yes_updates_the_same_row_rather_than_adding_one(dashboard_spy):
-    respond(step="see_options", answer="yes", phone="6305550147",
+def test_the_no_path_marks_wants_options_on_the_dashboard(dashboard_spy):
+    respond(step="see_options", answer="no", phone="6305550147",
             first_name="Dan", dealer_key="mcgrath_honda_stcharles")
+    # The opportunity path both records the appraisal and marks the same row as
+    # wanting options -- one customer, one row.
     assert dashboard_spy["options"] == [("mcgrath_honda_stcharles", "6305550147")]
-    assert dashboard_spy["recorded"] == [], "the second yes is not a new appraisal"
+    assert len(dashboard_spy["recorded"]) == 1
 
 
 def test_a_dashboard_outage_never_breaks_the_customer_thread(monkeypatch):
@@ -705,8 +722,8 @@ def test_a_dashboard_outage_never_breaks_the_customer_thread(monkeypatch):
     with pytest.raises(RuntimeError):
         # The real record_appraisal swallows its own errors; this proves the
         # test double is actually being reached, so the next assertion means
-        # something.
-        respond(step="value_offer", answer="yes", phone="6305550147")
+        # something. record_appraisal now sits on the "no" opportunity path.
+        respond(step="value_offer", answer="no", phone="6305550147")
 
 
 def test_the_real_writer_swallows_its_own_errors():
@@ -857,7 +874,7 @@ def test_stop_is_honoured_even_with_no_open_conversation():
 # ── Appointment time on the alert card ───────────────────────────────────────
 
 def test_the_alert_card_prints_a_readable_time():
-    r = respond(step="see_options", answer="yes", phone="6305550147",
+    r = respond(step="see_options", answer="no", phone="6305550147",
                 first_name="Dan", vehicle_year="2022", vehicle_make="Honda",
                 vehicle_model="CR-V", appointment_time="2026-09-22 09:30:00")
     assert "2026-09-22" not in r["alert_card"], r["alert_card"]
@@ -865,7 +882,7 @@ def test_the_alert_card_prints_a_readable_time():
 
 
 def test_an_unparseable_time_is_shown_rather_than_dropped():
-    r = respond(step="see_options", answer="yes", phone="6305550147",
+    r = respond(step="see_options", answer="no", phone="6305550147",
                 first_name="Dan", appointment_time="whenever they turn up")
     assert "whenever they turn up" in r["alert_card"]
 
