@@ -48,7 +48,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -330,6 +330,72 @@ def _spoken_time(raw: Optional[str]) -> Optional[str]:
     # %-I isn't portable to Windows, so strip the zero by hand.
     clock = when.strftime("%I:%M %p").lstrip("0")
     return f"{day} {clock}"
+
+
+# How long before the appointment the opener should land. The point is to catch
+# the customer while they're in for service, so a modest lead -- they get it on
+# the way in / as they arrive, and a "No" fires the walk-over alert while they're
+# actually on site. Tunable without a redeploy.
+EQUITY_LEAD_MINUTES = int(os.getenv("EQUITY_LEAD_MINUTES", "30"))
+# Never text outside daytime hours (TCPA quiet hours are 8am-9pm; we keep a
+# tighter 8am-8pm window). A time outside it is pushed to the next 8am.
+QUIET_START_HOUR = int(os.getenv("EQUITY_QUIET_START_HOUR", "8"))
+QUIET_END_HOUR = int(os.getenv("EQUITY_QUIET_END_HOUR", "20"))
+
+
+def _parse_appt(raw: Optional[str]) -> Optional[datetime]:
+    """The appointment as a timezone-aware datetime in the dealer's zone, or None
+    when the value isn't a real timestamp ("today", "Tue 9:00 AM", empty)."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    # myKaarma hands back ISO 8601, often with an offset. Honour it if present;
+    # a bare timestamp is read as dealer-local.
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=DEALER_TZ)
+        return dt.astimezone(DEALER_TZ)
+    except ValueError:
+        pass
+    for fmt in _APPT_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=DEALER_TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def _send_at(appointment_time: Optional[str],
+             now: Optional[datetime] = None) -> Optional[str]:
+    """When GHL should release the opener.
+
+    Shortly before the appointment, never in the past, and never outside daytime
+    hours. Returns an ISO 8601 string WITH offset so GHL's "until a specific
+    date/time" wait can't misread the timezone -- the raw appointment string did,
+    which is why a booking made at 1am fired the text at 1am instead of holding
+    for the morning visit.
+
+    Returns None when there's no usable appointment time; GHL then falls back to
+    its own default rather than being handed a bad value.
+    """
+    now = now or datetime.now(DEALER_TZ)
+    appt = _parse_appt(appointment_time)
+    target = now if appt is None else appt - timedelta(minutes=EQUITY_LEAD_MINUTES)
+
+    if target < now:                       # lead window already gone -> as soon as allowed
+        target = now
+
+    # Clamp into the daytime window.
+    if target.hour < QUIET_START_HOUR:
+        target = target.replace(hour=QUIET_START_HOUR, minute=0, second=0, microsecond=0)
+    elif target.hour >= QUIET_END_HOUR:
+        nxt = target + timedelta(days=1)
+        target = nxt.replace(hour=QUIET_START_HOUR, minute=0, second=0, microsecond=0)
+
+    return target.isoformat(timespec="seconds")
 
 
 def _days_since(raw: Optional[str]) -> Optional[int]:
@@ -947,7 +1013,7 @@ async def equity_screen(req: ScreenRequest):
         "equity_priority_reasons": "; ".join(pri["reasons"]),
         "appointment_day": req.appointment_day,
         "appointment_time": req.appointment_time,
-        "send_at": req.appointment_time,
+        "send_at": _send_at(req.appointment_time),
     })
 
     return {
