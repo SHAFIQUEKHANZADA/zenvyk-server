@@ -915,7 +915,28 @@ async def get_slots(req: SlotsRequest):
 
     _boundary = _boundary_phrase(slots, req.time) if time_pref_missed else ""
 
+    # Is the offered list everything that's open, or only the first few?
+    #
+    # Telling the agent "this day is exhausted" unconditionally is what broke the
+    # Elgin call on 2 Oct 2026. The caller wanted an oil change TODAY, was offered
+    # 10:30 and 11:00, said no, and was pushed to another day — while 12:00, 12:30,
+    # 1:00, 2:00, 2:30, 3:00, 4:00 and 4:30 all sat open. Nine openings, three
+    # offered, and the agent was instructed not to look again.
+    #
+    # The old wording is still right when the list IS the whole day — that's the
+    # loop _nearest_to_pref documents, where the caller asks for 5 PM, the last
+    # opening is 4:30, and re-searching returns the same three times forever.
+    #
+    # time_pref_missed MUST stay excluded. When the caller's time isn't open,
+    # `slots` is reset to day_fallback (the whole day), so a length test alone
+    # would see "more openings" and send the agent back to ask for a time it has
+    # already established isn't there — the very loop this guard prevents.
+    more_that_day = len(slots) > len(top) and not time_pref_missed
     no_repeat = (
+        " If none of these work, ask what time of day suits them — morning,"
+        " afternoon or evening — and call get_slots again for THIS SAME day with"
+        " that in the 'time' field. There ARE other openings on this day."
+        if more_that_day else
         " Searching this day again for a different time returns this SAME list,"
         " so do NOT call get_slots again for another time on this day. If none of"
         " these work, ask what OTHER DAY suits them and search that day instead."
@@ -950,10 +971,13 @@ async def get_slots(req: SlotsRequest):
             + no_repeat
         )
     else:
+        # This branch had no fallback at all, which is the one the Elgin caller hit:
+        # she named a day but no time, so nothing told the agent what to do when she
+        # declined. It improvised and changed the day.
         instruction = (
             "Offer ONLY these times. Do NOT invent or guess any other time. "
             "Once the customer chooses one, call book_appointment with the exact "
-            "matching value from 'slots'."
+            "matching value from 'slots'." + no_repeat
         )
 
     return {
